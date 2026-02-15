@@ -5,11 +5,13 @@ import { useSearchParams } from "next/navigation";
 import { BarChart3, Building2, FileSpreadsheet, ShieldCheck, Users } from "lucide-react";
 import {
   API_BASE_URL,
+  apiFetch,
   createChatSession,
   getPeriods,
   getRatios,
   getVariance,
   getMetricHistory,
+  setApiRole,
   sendChatMessage,
   uploadAndNormalizeExcel,
   clearPack,
@@ -115,6 +117,28 @@ function formatPercent(v: any) {
   return `${(v * 100).toFixed(2)}%`;
 }
 
+function normalizeInterpretationPayload(payload: any, fallback?: string) {
+  const risks = Array.isArray(payload?.risks) ? payload.risks : [];
+  return {
+    executive_summary: payload?.executive_summary || payload?.answer || fallback || "No interpretation available.",
+    profitability: payload?.profitability || null,
+    efficiency: payload?.efficiency || null,
+    balance_sheet: payload?.balance_sheet || null,
+    risks: risks.filter(Boolean),
+  };
+}
+
+function hasInterpretationContent(payload: any) {
+  if (!payload || typeof payload !== "object") return false;
+  return Boolean(
+    payload.executive_summary ||
+      payload.profitability ||
+      payload.efficiency ||
+      payload.balance_sheet ||
+      (Array.isArray(payload.risks) && payload.risks.length > 0)
+  );
+}
+
 type RolePermissions = {
   controls: boolean;
   evidence: boolean;
@@ -156,7 +180,7 @@ const ROLE_PERMISSIONS: Record<Role, RolePermissions> = {
   Director: {
     controls: false,
     evidence: true,
-    variance: true,
+    variance: false,
     ratios: true,
     exports: true,
     chat: false,
@@ -193,8 +217,8 @@ const ROLE_PERMISSIONS: Record<Role, RolePermissions> = {
 
 const ROLE_SECTIONS: Record<Role, NavSection[]> = {
   CFO: ["Overview", "Statements", "Governance", "Roles & Access"],
-  CEO: ["Overview"],
-  Director: ["Overview", "Statements", "Governance"],
+  CEO: ["Overview", "Governance"],
+  Director: ["Overview", "Governance"],
   Shareholder: ["Overview"],
   CB: ["Overview", "Governance"],
 };
@@ -240,11 +264,13 @@ function PageWithParams() {
   const [chatOpen, setChatOpen] = React.useState<boolean>(false);
   const [chatSessionId, setChatSessionId] = React.useState<string | null>(null);
   const [chatInput, setChatInput] = React.useState<string>("");
+  const [chatLoading, setChatLoading] = React.useState<boolean>(false);
   const [chatMessages, setChatMessages] = React.useState<ChatMessage[]>([]);
   const [summaryData, setSummaryData] = React.useState<any | null>(null);
   const [summaryLoading, setSummaryLoading] = React.useState<boolean>(false);
   const [interpretationData, setInterpretationData] = React.useState<any | null>(null);
   const [interpretationLoading, setInterpretationLoading] = React.useState<boolean>(false);
+  const [exportLoading, setExportLoading] = React.useState<boolean>(false);
   const chatScrollRef = React.useRef<HTMLDivElement | null>(null);
   const [theme, setTheme] = React.useState<"dark" | "light">("dark");
   const [showApiWarning, setShowApiWarning] = React.useState(false);
@@ -359,6 +385,25 @@ function PageWithParams() {
       cancelled = true;
     };
   }, [initialQueryPeriod]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const storedRole = window.localStorage.getItem("finance_hub_role");
+    if (storedRole && ["CFO", "CEO", "Director", "Shareholder", "CB"].includes(storedRole)) {
+      setRole(storedRole as Role);
+      setApiRole(storedRole);
+      return;
+    }
+    setApiRole(role);
+    window.localStorage.setItem("finance_hub_role", role);
+  }, []);
+
+  React.useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("finance_hub_role", role);
+    }
+    setApiRole(role);
+  }, [role]);
 
   React.useEffect(() => {
     if (typeof window === "undefined") return;
@@ -519,21 +564,45 @@ function PageWithParams() {
   }
 
   async function handleExportBoardPack() {
+    if (exportLoading) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/exports/board-pack`);
+      setExportLoading(true);
+      const res = await apiFetch(`/exports/board-pack`);
       if (!res.ok) {
         let message = "Board Pack export failed.";
         try {
           const body = await res.json();
-          if (body?.detail) message = body.detail;
+          if (body?.detail) {
+            message = typeof body.detail === "string" ? body.detail : body.detail.detail || JSON.stringify(body.detail);
+          }
         } catch {
           // ignore
         }
         setExportMessage(message);
+        setToast({ type: "error", message });
         setTimeout(() => setExportMessage(null), 2500);
+        setTimeout(() => setToast(null), 2500);
+        return;
+      }
+      const contentType = res.headers.get("content-type") || "";
+      if (!contentType.includes("application/pdf")) {
+        const text = await res.text();
+        const message = `Unexpected export response: ${text || "invalid content type"}`;
+        setExportMessage(message);
+        setToast({ type: "error", message });
+        setTimeout(() => setExportMessage(null), 2500);
+        setTimeout(() => setToast(null), 2500);
         return;
       }
       const blob = await res.blob();
+      if (!blob.size) {
+        const message = "Board Pack export failed: empty PDF.";
+        setExportMessage(message);
+        setToast({ type: "error", message });
+        setTimeout(() => setExportMessage(null), 2500);
+        setTimeout(() => setToast(null), 2500);
+        return;
+      }
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -543,10 +612,17 @@ function PageWithParams() {
       link.remove();
       URL.revokeObjectURL(url);
       setExportMessage("Board Pack PDF downloaded.");
+      setToast({ type: "success", message: "Board Pack PDF downloaded." });
       setTimeout(() => setExportMessage(null), 2500);
-    } catch {
-      setExportMessage("Board Pack export failed.");
+      setTimeout(() => setToast(null), 2500);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Board Pack export failed.";
+      setExportMessage(message);
+      setToast({ type: "error", message });
       setTimeout(() => setExportMessage(null), 2500);
+      setTimeout(() => setToast(null), 2500);
+    } finally {
+      setExportLoading(false);
     }
   }
 
@@ -561,6 +637,7 @@ function PageWithParams() {
   }
 
   async function handleSendChat(messageOverride?: string) {
+    if (chatLoading) return;
     const text = (messageOverride ?? chatInput).trim();
     if (!text) return;
     if (!messageOverride) setChatInput("");
@@ -575,8 +652,9 @@ function PageWithParams() {
     }
 
     try {
+      setChatLoading(true);
       const sessionId = await ensureChatSession();
-      const res = await sendChatMessage(sessionId, text, entity, period || "", scenario, evidenceContext);
+      const res = await sendChatMessage(sessionId, text, entity, period || "", scenario, evidenceContext, 1);
       if (res.ok) {
         setChatMessages((prev) => [
           ...prev,
@@ -607,11 +685,23 @@ function PageWithParams() {
             clearInterval(interval);
           }
         }, 20);
+        if (res.data?.meta?.reason === "ai_not_configured") {
+          setToast({ type: "error", message: "AI key missing. Showing deterministic financial responses." });
+          setTimeout(() => setToast(null), 3000);
+        }
       } else {
-        setChatMessages((prev) => [...prev, { role: "assistant", content: res.message || "No answer." }]);
+        const errorMessage = res.message || "No answer.";
+        setChatMessages((prev) => [...prev, { role: "assistant", content: errorMessage }]);
+        setToast({ type: "error", message: errorMessage });
+        setTimeout(() => setToast(null), 3000);
       }
-    } catch {
-      setChatMessages((prev) => [...prev, { role: "assistant", content: "Sorry, I could not answer that right now." }]);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : "Sorry, I could not answer that right now.";
+      setChatMessages((prev) => [...prev, { role: "assistant", content: errorMessage }]);
+      setToast({ type: "error", message: errorMessage });
+      setTimeout(() => setToast(null), 3000);
+    } finally {
+      setChatLoading(false);
     }
   }
 
@@ -650,14 +740,21 @@ function PageWithParams() {
       const sessionId = await ensureChatSession();
       const prompt =
         "Interpret the financial report from a CFO perspective with sections: Executive Summary, Profitability, Efficiency, Balance Sheet, and Risks. Keep it concise and evidence-based.";
-      const res = await sendChatMessage(sessionId, prompt, entity, period, scenario);
-      if (res.ok) {
-        setInterpretationData(res.data.interpretation || { executive_summary: res.data.answer });
-      } else {
-        setInterpretationData({ executive_summary: res.message || "Could not generate interpretation." });
+      const res = await sendChatMessage(sessionId, prompt, entity, period, scenario, undefined, 1);
+      if (typeof window !== "undefined") {
+        console.debug("[finance-hub] interpretation payload", res);
       }
-    } catch {
-      setInterpretationData({ executive_summary: "Could not generate interpretation right now." });
+      if (res.ok) {
+        const payload = hasInterpretationContent(res.data.interpretation)
+          ? normalizeInterpretationPayload(res.data.interpretation)
+          : normalizeInterpretationPayload(null, res.data.answer);
+        setInterpretationData(payload);
+      } else {
+        setInterpretationData(normalizeInterpretationPayload(null, res.message || "No interpretation available."));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not generate interpretation right now.";
+      setInterpretationData(normalizeInterpretationPayload(null, message));
     } finally {
       setInterpretationLoading(false);
     }
@@ -1061,6 +1158,10 @@ function PageWithParams() {
                     <button
                       className={cn("whitespace-nowrap", buttonGhost)}
                       onClick={() => {
+                        const confirmed = window.confirm(
+                          "Clear all uploaded pack data? This cannot be undone."
+                        );
+                        if (!confirmed) return;
                         void (async () => {
                           const res = await clearPack();
                           if (!res.ok) {
@@ -1106,21 +1207,23 @@ function PageWithParams() {
                   {canSeeExports ? (
                     <div className="relative">
                       <button
-                        className={cn("whitespace-nowrap", buttonGhost)}
+                        className={cn("whitespace-nowrap disabled:opacity-60", buttonGhost)}
                         onClick={() => setExportOpen((v) => !v)}
+                        disabled={exportLoading}
                       >
-                        Export
+                        {exportLoading ? "Exporting..." : "Export"}
                       </button>
                       {exportOpen ? (
                         <div className={cn("absolute right-0 top-[110%] z-10 w-48 rounded-2xl border p-2 shadow-xl", isLight ? "border-slate-200 bg-white" : "border-white/10 bg-[#0B0F1A]")}>
                           <button
-                            className={cn("w-full rounded-xl px-3 py-2 text-left text-xs", isLight ? "text-slate-700 hover:bg-slate-100" : "text-white/80 hover:bg-white/5")}
+                            className={cn("w-full rounded-xl px-3 py-2 text-left text-xs disabled:opacity-60", isLight ? "text-slate-700 hover:bg-slate-100" : "text-white/80 hover:bg-white/5")}
                             onClick={() => {
                               setExportOpen(false);
                               void handleExportBoardPack();
                             }}
+                            disabled={exportLoading}
                           >
-                            Board Pack (PDF/PPT)
+                            {exportLoading ? "Generating Board Pack..." : "Board Pack (PDF/PPT)"}
                           </button>
                           <button
                             className={cn("mt-1 w-full rounded-xl px-3 py-2 text-left text-xs", isLight ? "text-slate-500 hover:bg-slate-100" : "text-white/60 hover:bg-white/5")}
@@ -1430,7 +1533,11 @@ function PageWithParams() {
                           </div>
                         </div>
                       </div>
-                    ) : null}
+                    ) : (
+                      <div className={cn("mt-4 rounded-2xl border p-4 text-sm", cardInner)}>
+                        No interpretation available.
+                      </div>
+                    )}
                   </div>
 
                   <section className="mt-6 grid gap-4 lg:grid-cols-3">
@@ -1633,7 +1740,7 @@ function PageWithParams() {
                     ].map((item) => (
                       <button
                         key={item.label}
-                        className={cn("rounded-full border px-3 py-1 text-[11px]", cardInner)}
+                        className={cn("rounded-full border px-3 py-1 text-[11px] disabled:opacity-60", cardInner)}
                         onClick={() => {
                           if (item.scrollVariance) {
                             setRole("CFO");
@@ -1642,6 +1749,7 @@ function PageWithParams() {
                           }
                           void handleSendChat(item.msg);
                         }}
+                        disabled={chatLoading}
                       >
                         {item.label}
                       </button>
@@ -1732,9 +1840,10 @@ function PageWithParams() {
                     onKeyDown={(e) => {
                       if (e.key === "Enter") void handleSendChat();
                     }}
+                    disabled={chatLoading}
                   />
-                  <button className={chatSendClass} onClick={() => void handleSendChat()}>
-                    Send
+                  <button className={cn(chatSendClass, "disabled:opacity-60")} onClick={() => void handleSendChat()} disabled={chatLoading}>
+                    {chatLoading ? "Sending..." : "Send"}
                   </button>
                 </div>
               </div>

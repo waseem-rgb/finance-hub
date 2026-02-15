@@ -1,5 +1,7 @@
 const RAW_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "http://127.0.0.1:8000";
 export const API_BASE_URL = RAW_API_BASE_URL.replace(/\/+$/, "");
+const VALID_ROLES = new Set(["CFO", "CEO", "Director", "Shareholder", "CB"]);
+let activeRole = "CFO";
 
 if (typeof window !== "undefined" && process.env.NODE_ENV !== "production") {
   // Dev-only startup diagnostic for confirming resolved API target.
@@ -8,6 +10,18 @@ if (typeof window !== "undefined" && process.env.NODE_ENV !== "production") {
 
 type ApiOk<T> = { ok: true; data: T };
 type ApiErr = { ok: false; error: string; message: string };
+
+export function setApiRole(role: string) {
+  if (VALID_ROLES.has(role)) {
+    activeRole = role;
+  }
+}
+
+function withRoleHeader(init?: RequestInit): RequestInit {
+  const headers = new Headers(init?.headers || undefined);
+  headers.set("X-User-Role", activeRole);
+  return { ...(init || {}), headers };
+}
 
 async function handleResponse<T>(res: Response): Promise<ApiOk<T> | ApiErr> {
   if (!res.ok) {
@@ -26,11 +40,15 @@ async function handleResponse<T>(res: Response): Promise<ApiOk<T> | ApiErr> {
 
 async function request<T>(path: string, init?: RequestInit): Promise<ApiOk<T> | ApiErr> {
   try {
-    const res = await fetch(`${API_BASE_URL}${path}`, init);
+    const res = await fetch(`${API_BASE_URL}${path}`, withRoleHeader(init));
     return await handleResponse<T>(res);
   } catch (err) {
     return { ok: false, error: "NETWORK_ERROR", message: err instanceof Error ? err.message : "Network error" };
   }
+}
+
+export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${API_BASE_URL}${path}`, withRoleHeader(init));
 }
 
 export function getPeriods() {
@@ -71,25 +89,53 @@ export function sendChatMessage(
   entity?: string,
   period?: string,
   scenario?: string,
-  evidence_context?: any[]
+  evidence_context?: any[],
+  retryCount: number = 0
 ) {
-  return request<{
-    session_id: string;
-    answer: string;
-    summary?: any;
-    interpretation?: any;
-    citations: any[];
-    used_period: string | null;
-    used_metrics: string[];
-    data_backed?: boolean;
-  }>(
-    "/chat/message",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id, message, entity, period, scenario, evidence_context }),
+  const doRequest = () =>
+    request<{
+      session_id: string;
+      answer: string;
+      summary?: any;
+      interpretation?: any;
+      citations: any[];
+      used_period: string | null;
+      used_metrics: string[];
+      data_backed?: boolean;
+      meta?: { provider?: string; reason?: string; detail?: string };
+    }>(
+      "/chat/message",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id, message, entity, period, scenario, evidence_context }),
+      }
+    );
+
+  if (retryCount <= 0) {
+    return doRequest();
+  }
+
+  return (async () => {
+    let last: ApiOk<any> | ApiErr = await doRequest();
+    let attempts = retryCount;
+    while (!last.ok && attempts > 0 && (last.error === "NETWORK_ERROR" || /temporar|timeout|unavailable/i.test(last.message))) {
+      await new Promise((resolve) => setTimeout(resolve, (retryCount - attempts + 1) * 500));
+      last = await doRequest();
+      attempts -= 1;
     }
-  );
+    return last as ApiOk<{
+      session_id: string;
+      answer: string;
+      summary?: any;
+      interpretation?: any;
+      citations: any[];
+      used_period: string | null;
+      used_metrics: string[];
+      data_backed?: boolean;
+      meta?: { provider?: string; reason?: string; detail?: string };
+    }> | ApiErr;
+  })();
 }
 
 export function getBoardPack() {

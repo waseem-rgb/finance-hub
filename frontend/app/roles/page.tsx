@@ -3,6 +3,26 @@
 import React from "react";
 
 export default function RolesPage() {
+  const [role, setRole] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const storedRole = window.localStorage.getItem("finance_hub_role");
+    setRole(storedRole || "CFO");
+  }, []);
+
+  if (role !== null && role !== "CFO") {
+    return (
+      <div className="min-h-screen bg-[#070A12] p-8 text-white">
+        <div className="mx-auto max-w-3xl rounded-3xl border border-red-400/30 bg-red-500/10 p-6">
+          <h1 className="text-xl font-semibold">Access Denied</h1>
+          <p className="mt-2 text-sm text-white/80">
+            The Roles & Access page is restricted to CFO.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#070A12] p-8 text-white">
       <div className="mx-auto max-w-3xl rounded-3xl border border-white/10 bg-white/[0.03] p-6">

@@ -11,7 +11,7 @@ from textwrap import wrap
 from typing import Any, Dict, Optional
 from urllib import request as urlrequest
 
-from fastapi import Body, FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -27,6 +27,13 @@ LAST_NORMALIZED: Dict[str, Any] | None = None
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
 AI_LOGGER = logging.getLogger("finance_hub.ai")
+ALLOWED_ROLES = {"CFO", "CEO", "Director", "Shareholder", "CB"}
+
+ROLE_ROUTE_ACCESS: dict[str, set[str]] = {
+    "view_overview": {"CFO", "CEO", "Director", "Shareholder", "CB"},
+    "view_exec_governance": {"CFO", "CEO", "Director", "CB"},
+    "cfo_only": {"CFO"},
+}
 
 app = FastAPI(title="Finance Hub API", version="0.1.0")
 
@@ -46,6 +53,38 @@ app.add_middleware(
 )
 
 
+def _extract_role(role_header: Optional[str]) -> str:
+    role = (role_header or "").strip()
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "access_denied",
+                "detail": "Invalid or missing role. Expected one of: CFO, CEO, Director, Shareholder, CB.",
+            },
+        )
+    return role
+
+
+def require_roles(access_key: str):
+    allowed = ROLE_ROUTE_ACCESS[access_key]
+
+    def _guard(x_user_role: Optional[str] = Header(default=None, alias="X-User-Role")) -> str:
+        role = _extract_role(x_user_role)
+        if role not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "access_denied",
+                    "detail": f"Role '{role}' is not allowed for this action.",
+                    "allowed_roles": sorted(list(allowed)),
+                },
+            )
+        return role
+
+    return _guard
+
+
 def _format_million(value: Any) -> str:
     if value is None or not isinstance(value, (int, float)):
         return "—"
@@ -56,6 +95,38 @@ class AIProviderError(Exception):
     def __init__(self, detail: str):
         super().__init__(detail)
         self.detail = detail
+
+
+def _normalize_interpretation_payload(payload: Any, fallback: Optional[str] = None) -> dict:
+    if isinstance(payload, dict):
+        risks = payload.get("risks")
+        if not isinstance(risks, list):
+            risks = [str(risks)] if risks else []
+        return {
+            "executive_summary": payload.get("executive_summary")
+            or payload.get("answer")
+            or fallback
+            or "No interpretation available.",
+            "profitability": payload.get("profitability"),
+            "efficiency": payload.get("efficiency"),
+            "balance_sheet": payload.get("balance_sheet"),
+            "risks": [str(item) for item in risks if item is not None],
+        }
+    if isinstance(payload, str) and payload.strip():
+        return {
+            "executive_summary": payload.strip(),
+            "profitability": None,
+            "efficiency": None,
+            "balance_sheet": None,
+            "risks": [],
+        }
+    return {
+        "executive_summary": fallback or "No interpretation available.",
+        "profitability": None,
+        "efficiency": None,
+        "balance_sheet": None,
+        "risks": [],
+    }
 
 
 def _get_openai_api_key() -> str | None:
@@ -122,9 +193,9 @@ def generate_openai_interpretation(
             ]
         )
         try:
-            return json.loads(content)
+            return _normalize_interpretation_payload(json.loads(content))
         except json.JSONDecodeError:
-            return {"answer": content, "citations": [], "data_backed": False}
+            return _normalize_interpretation_payload(content)
     except AIProviderError:
         return None
 
@@ -146,7 +217,13 @@ def generate_openai_answer(message: str, context: dict, history: list[dict]) -> 
             {"role": "user", "content": prompt},
         ]
     )
-    return json.loads(content)
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return {"answer": content, "citations": [], "data_backed": False}
+    if not isinstance(payload, dict):
+        return {"answer": str(payload), "citations": [], "data_backed": False}
+    return payload
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -157,6 +234,7 @@ def ratios(
     entity: str = "UAE Entity 01",
     period: str = "Mar-2025",
     scenario: str = "Actual",
+    _: str = Depends(require_roles("view_overview")),
 ) -> Dict[str, Any]:
     pack = PACK_STORE.get_latest_pack()
     if pack:
@@ -340,7 +418,11 @@ def ratios(
     }
 
 @app.post("/uploads/excel")
-async def upload_excel(file: UploadFile = File(...), save: bool = False) -> Dict[str, Any]:
+async def upload_excel(
+    file: UploadFile = File(...),
+    save: bool = False,
+    _: str = Depends(require_roles("cfo_only")),
+) -> Dict[str, Any]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename required")
     if not file.filename.lower().endswith(".xlsx"):
@@ -395,7 +477,10 @@ async def upload_excel(file: UploadFile = File(...), save: bool = False) -> Dict
                 pass
 
 @app.post("/uploads/excel/normalize")
-async def normalize_excel(file: UploadFile = File(...)) -> Dict[str, Any]:
+async def normalize_excel(
+    file: UploadFile = File(...),
+    _: str = Depends(require_roles("cfo_only")),
+) -> Dict[str, Any]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename required")
     if not file.filename.lower().endswith(".xlsx"):
@@ -447,7 +532,10 @@ async def normalize_excel(file: UploadFile = File(...)) -> Dict[str, Any]:
                 pass
 
 @app.get("/periods")
-def get_periods(entity: str = "UAE Entity 01") -> Dict[str, Any]:
+def get_periods(
+    entity: str = "UAE Entity 01",
+    _: str = Depends(require_roles("view_overview")),
+) -> Dict[str, Any]:
     pack = PACK_STORE.get_latest_pack()
     if not pack:
         return {
@@ -465,7 +553,7 @@ def get_periods(entity: str = "UAE Entity 01") -> Dict[str, Any]:
 
 
 @app.post("/pack/clear")
-def clear_pack() -> Dict[str, Any]:
+def clear_pack(_: str = Depends(require_roles("cfo_only"))) -> Dict[str, Any]:
     PACK_STORE.clear()
     CHAT_STORE.clear()
     return {"status": "cleared"}
@@ -476,6 +564,7 @@ def get_variance(
     period_to: str,
     scenario: str = "Actual",
     entity: str = "UAE Entity 01",
+    _: str = Depends(require_roles("view_exec_governance")),
 ) -> Dict[str, Any]:
     pack = PACK_STORE.get_latest_pack()
     if not pack:
@@ -521,240 +610,268 @@ class ChatMessageRequest(BaseModel):
 
 
 @app.post("/chat/session")
-def create_chat_session(_: ChatSessionRequest = Body(default={})) -> Dict[str, Any]:
+def create_chat_session(
+    _: ChatSessionRequest = Body(default={}),
+    role: str = Depends(require_roles("cfo_only")),
+) -> Dict[str, Any]:
     session = CHAT_STORE.create_session()
+    session.memory["role"] = role
     return {"session_id": session.session_id}
 
 
 @app.post("/chat/message")
-def send_chat_message(payload: ChatMessageRequest) -> Dict[str, Any]:
-    session = CHAT_STORE.get_session(payload.session_id)
-    if not session:
-        raise HTTPException(status_code=400, detail="Invalid session_id")
+def send_chat_message(
+    payload: ChatMessageRequest,
+    role: str = Depends(require_roles("cfo_only")),
+) -> Dict[str, Any]:
+    try:
+        session = CHAT_STORE.get_session(payload.session_id)
+        if not session:
+            raise HTTPException(status_code=400, detail="Invalid session_id")
 
-    message = payload.message.strip()
-    CHAT_STORE.add_message(payload.session_id, "user", message)
+        session_role = session.memory.get("role")
+        if session_role and session_role != role:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "access_denied", "detail": "Session role mismatch. Start a new chat session."},
+            )
 
-    if not _get_openai_api_key():
-        raise HTTPException(status_code=503, detail={"error": "ai_not_configured", "detail": "AI not configured"})
+        message = payload.message.strip()
+        if not message:
+            raise HTTPException(status_code=400, detail={"error": "invalid_request", "detail": "Message cannot be empty"})
 
-    pack = PACK_STORE.get_latest_pack()
-    if not pack:
-        answer = "No financial pack uploaded yet. Upload and normalize an Excel file first."
+        CHAT_STORE.add_message(payload.session_id, "user", message)
+
+        pack = PACK_STORE.get_latest_pack()
+        if not pack:
+            answer = "No financial pack uploaded yet. Upload and normalize an Excel file first."
+            return {
+                "session_id": payload.session_id,
+                "answer": answer,
+                "citations": [],
+                "used_period": None,
+                "used_metrics": [],
+                "data_backed": False,
+                "meta": {"provider": "fallback", "reason": "no_pack"},
+                "interpretation": _normalize_interpretation_payload(None, answer),
+            }
+
+        computed = compute_ratios(
+            {"facts": pack.normalized_facts, "periods": pack.periods},
+            payload.period,
+        )
+        period_used = computed.get("period_used")
+        sources = computed.get("sources", {})
+
+        used_metrics = []
+        citations = []
+
+        def to_evidence_item(source: dict | None) -> dict | None:
+            if not source:
+                return None
+            lineage = source.get("lineage", {})
+            return {
+                "statement": source.get("statement"),
+                "line_item": source.get("line_item"),
+                "value": source.get("value"),
+                "period": source.get("period"),
+                "sheet": lineage.get("sheet"),
+                "row_index": lineage.get("row_index"),
+                "col": lineage.get("column"),
+            }
+
+        def add_metric(metric_key: str, source_key: str):
+            source = sources.get(source_key)
+            if source:
+                used_metrics.append(metric_key)
+                item = to_evidence_item(source)
+                if item:
+                    citations.append(item)
+
+        msg_lower = message.lower()
+
+        evidence_list = []
+        for key in ["assets", "equity", "net_profit", "customers_deposits", "total_income", "operating_expenses"]:
+            item = to_evidence_item(sources.get(key))
+            if item:
+                evidence_list.append(item)
+        if "summary" in msg_lower or "structured" in msg_lower:
+            add_metric("total_assets", "assets")
+            add_metric("total_equity", "equity")
+            add_metric("net_profit", "net_profit")
+            add_metric("cost_to_income", "operating_expenses")
+            add_metric("cost_to_income", "total_income")
+
+        interpretation_structured = _normalize_interpretation_payload(None)
+        data_backed = True
+
+        if "interpret" in msg_lower:
+            assets_val = sources.get("assets", {}).get("value")
+            equity_val = sources.get("equity", {}).get("value")
+            net_profit_val = sources.get("net_profit", {}).get("value")
+            roa_val = computed.get("ratios", {}).get("roa")
+            roe_val = computed.get("ratios", {}).get("roe")
+            cti_val = computed.get("ratios", {}).get("cost_to_income")
+            default_interp = _normalize_interpretation_payload(
+                {
+                    "executive_summary": f"For {period_used}, results show net profit of {_format_million(net_profit_val)} against total assets of {_format_million(assets_val)}.",
+                    "profitability": f"ROA is {roa_val:.4f} and ROE is {roe_val:.4f} based on reported net profit and equity.",
+                    "efficiency": f"Cost-to-income is {cti_val:.4f}, using absolute operating expenses for consistency.",
+                    "balance_sheet": f"Total assets are {_format_million(assets_val)} and total equity is {_format_million(equity_val)}.",
+                    "risks": ["Validate income and expense classification for period consistency."],
+                }
+            )
+            interpretation_structured = generate_openai_interpretation(
+                entity_name=pack.entity or payload.entity or "Entity",
+                period=period_used,
+                assets=assets_val,
+                equity=equity_val,
+                net_profit=net_profit_val,
+                roa=roa_val,
+                roe=roe_val,
+                cti=cti_val,
+            ) or default_interp
+
+            answer = interpretation_structured.get("executive_summary") or default_interp["executive_summary"]
+        elif "roa" in msg_lower:
+            add_metric("roa_annualized", "assets")
+            add_metric("roa_annualized", "net_profit")
+            value = computed.get("ratios", {}).get("roa")
+            answer = (
+                f"ROA for {period_used} is {value:.4f} based on Net Profit and Total Assets."
+                if isinstance(value, (int, float))
+                else f"ROA for {period_used} is not available yet."
+            )
+        elif "roe" in msg_lower:
+            add_metric("roe_annualized", "equity")
+            add_metric("roe_annualized", "net_profit")
+            value = computed.get("ratios", {}).get("roe")
+            answer = (
+                f"ROE for {period_used} is {value:.4f} based on Net Profit and Total Equity."
+                if isinstance(value, (int, float))
+                else f"ROE for {period_used} is not available yet."
+            )
+        elif "cost" in msg_lower or "cti" in msg_lower:
+            add_metric("cost_to_income", "operating_expenses")
+            add_metric("cost_to_income", "total_income")
+            value = computed.get("ratios", {}).get("cost_to_income")
+            answer = (
+                f"Cost-to-income for {period_used} is {value:.4f} based on Operating Expenses and Total Income."
+                if isinstance(value, (int, float))
+                else f"Cost-to-income for {period_used} is not available yet."
+            )
+        elif "total assets" in msg_lower:
+            add_metric("total_assets", "assets")
+            value = sources.get("assets", {}).get("value")
+            answer = f"Total Assets for {period_used} is {value}."
+        elif "net profit" in msg_lower:
+            add_metric("net_profit", "net_profit")
+            value = sources.get("net_profit", {}).get("value")
+            answer = f"Net Profit for {period_used} is {value}."
+        else:
+            answer = f"I can explain ROA, ROE, cost-to-income, total assets, or net profit. Period in use: {period_used}."
+
+        meta = {"provider": "fallback", "reason": "heuristic"}
+        history = session.messages[-8:] if session.messages else []
+        if _get_openai_api_key():
+            try:
+                openai_payload = generate_openai_answer(
+                    message=message,
+                    context={
+                        "entity": pack.entity or payload.entity,
+                        "period": period_used,
+                        "kpis": {
+                            "total_assets": sources.get("assets", {}).get("value"),
+                            "total_equity": sources.get("equity", {}).get("value"),
+                            "net_profit": sources.get("net_profit", {}).get("value"),
+                            "customers_deposits": sources.get("customers_deposits", {}).get("value"),
+                        },
+                        "ratios": computed.get("ratios"),
+                        "evidence": evidence_list,
+                        "evidence_from_drawer": payload.evidence_context or [],
+                    },
+                    history=history,
+                )
+                if isinstance(openai_payload.get("answer"), str):
+                    answer = openai_payload["answer"]
+                    citations = openai_payload.get("citations") or citations
+                    data_backed = bool(openai_payload.get("data_backed"))
+                    meta = {"provider": "openai", "reason": "ok"}
+                else:
+                    AI_LOGGER.error("OpenAI payload missing answer field: %s", openai_payload)
+                    data_backed = False
+                    meta = {"provider": "fallback", "reason": "missing_answer_field"}
+            except AIProviderError as exc:
+                AI_LOGGER.exception("AI provider error in /chat/message: %s", exc.detail)
+                data_backed = False
+                meta = {"provider": "fallback", "reason": "ai_provider_error", "detail": exc.detail}
+            except Exception as exc:
+                AI_LOGGER.exception("AI processing failed (%s): %s", exc.__class__.__name__, str(exc))
+                data_backed = False
+                meta = {"provider": "fallback", "reason": "ai_processing_exception"}
+        else:
+            data_backed = False
+            meta = {"provider": "fallback", "reason": "ai_not_configured"}
+
+        summary = {
+            "executive_summary": f"Summary for {period_used} based on latest uploaded pack.",
+            "key_kpis": {
+                "total_assets": sources.get("assets", {}).get("value"),
+                "total_equity": sources.get("equity", {}).get("value"),
+                "net_profit": sources.get("net_profit", {}).get("value"),
+            },
+            "profitability": {
+                "roa": computed.get("ratios", {}).get("roa"),
+                "roe": computed.get("ratios", {}).get("roe"),
+            },
+            "efficiency": {
+                "cost_to_income": computed.get("ratios", {}).get("cost_to_income"),
+            },
+            "balance_sheet": {
+                "total_assets": sources.get("assets", {}).get("value"),
+                "total_equity": sources.get("equity", {}).get("value"),
+            },
+            "risks": ["Review expense structure if cost-to-income is elevated."],
+            "evidence": citations,
+        }
+
+        CHAT_STORE.add_message(payload.session_id, "assistant", answer)
+        session.memory.update(
+            {
+                "entity": payload.entity,
+                "period": period_used,
+                "scenario": payload.scenario,
+                "last_metrics": used_metrics,
+                "role": role,
+            }
+        )
         return {
             "session_id": payload.session_id,
             "answer": answer,
-            "citations": [],
-            "used_period": None,
-            "used_metrics": [],
-            "data_backed": False,
+            "summary": summary,
+            "interpretation": interpretation_structured,
+            "citations": citations,
+            "data_backed": data_backed,
+            "used_period": period_used,
+            "used_metrics": used_metrics,
+            "meta": meta,
         }
-
-    computed = compute_ratios(
-        {"facts": pack.normalized_facts, "periods": pack.periods},
-        payload.period,
-    )
-    period_used = computed.get("period_used")
-    sources = computed.get("sources", {})
-
-    used_metrics = []
-    citations = []
-
-    def to_evidence_item(source: dict | None) -> dict | None:
-        if not source:
-            return None
-        lineage = source.get("lineage", {})
-        return {
-            "statement": source.get("statement"),
-            "line_item": source.get("line_item"),
-            "value": source.get("value"),
-            "period": source.get("period"),
-            "sheet": lineage.get("sheet"),
-            "row_index": lineage.get("row_index"),
-            "col": lineage.get("column"),
-        }
-
-    def add_metric(metric_key: str, source_key: str):
-        source = sources.get(source_key)
-        if source:
-            used_metrics.append(metric_key)
-            item = to_evidence_item(source)
-            if item:
-                citations.append(item)
-
-    msg_lower = message.lower()
-
-    evidence_list = []
-    for key in ["assets", "equity", "net_profit", "customers_deposits", "total_income", "operating_expenses"]:
-        item = to_evidence_item(sources.get(key))
-        if item:
-            evidence_list.append(item)
-    if "summary" in msg_lower or "structured" in msg_lower:
-        add_metric("total_assets", "assets")
-        add_metric("total_equity", "equity")
-        add_metric("net_profit", "net_profit")
-        add_metric("cost_to_income", "operating_expenses")
-        add_metric("cost_to_income", "total_income")
-
-    interpretation_structured = {
-        "executive_summary": None,
-        "profitability": None,
-        "efficiency": None,
-        "balance_sheet": None,
-        "risks": [],
-    }
-
-    if "interpret" in msg_lower:
-        assets_val = sources.get("assets", {}).get("value")
-        equity_val = sources.get("equity", {}).get("value")
-        net_profit_val = sources.get("net_profit", {}).get("value")
-        roa_val = computed.get("ratios", {}).get("roa")
-        roe_val = computed.get("ratios", {}).get("roe")
-        cti_val = computed.get("ratios", {}).get("cost_to_income")
-
-        interpretation_structured = generate_openai_interpretation(
-            entity_name=pack.entity or payload.entity or "Entity",
-            period=period_used,
-            assets=assets_val,
-            equity=equity_val,
-            net_profit=net_profit_val,
-            roa=roa_val,
-            roe=roe_val,
-            cti=cti_val,
-        ) or {
-            "executive_summary": f"For {period_used}, results show net profit of {_format_million(net_profit_val)} against total assets of {_format_million(assets_val)}.",
-            "profitability": f"ROA is {roa_val:.4f} and ROE is {roe_val:.4f} based on reported net profit and equity.",
-            "efficiency": f"Cost-to-income is {cti_val:.4f}, using absolute operating expenses for consistency.",
-            "balance_sheet": f"Total assets are {_format_million(assets_val)} and total equity is {_format_million(equity_val)}.",
-            "risks": ["Validate income and expense classification for period consistency."],
-        }
-
-        answer = interpretation_structured.get("executive_summary") or (
-            f"Interpretation for {period_used}: Net profit {_format_million(net_profit_val)} "
-            f"on assets {_format_million(assets_val)}. ROA {roa_val:.4f}, ROE {roe_val:.4f}. "
-            f"Cost-to-income {cti_val:.4f} using absolute expenses."
-        )
-    elif "roa" in msg_lower:
-        add_metric("roa_annualized", "assets")
-        add_metric("roa_annualized", "net_profit")
-        value = computed.get("ratios", {}).get("roa")
-        answer = (
-            f"ROA for {period_used} is {value:.4f} based on Net Profit and Total Assets."
-            if isinstance(value, (int, float))
-            else f"ROA for {period_used} is not available yet."
-        )
-    elif "roe" in msg_lower:
-        add_metric("roe_annualized", "equity")
-        add_metric("roe_annualized", "net_profit")
-        value = computed.get("ratios", {}).get("roe")
-        answer = (
-            f"ROE for {period_used} is {value:.4f} based on Net Profit and Total Equity."
-            if isinstance(value, (int, float))
-            else f"ROE for {period_used} is not available yet."
-        )
-    elif "cost" in msg_lower or "cti" in msg_lower:
-        add_metric("cost_to_income", "operating_expenses")
-        add_metric("cost_to_income", "total_income")
-        value = computed.get("ratios", {}).get("cost_to_income")
-        answer = (
-            f"Cost-to-income for {period_used} is {value:.4f} based on Operating Expenses and Total Income."
-            if isinstance(value, (int, float))
-            else f"Cost-to-income for {period_used} is not available yet."
-        )
-    elif "total assets" in msg_lower:
-        add_metric("total_assets", "assets")
-        value = sources.get("assets", {}).get("value")
-        answer = f"Total Assets for {period_used} is {value}."
-    elif "net profit" in msg_lower:
-        add_metric("net_profit", "net_profit")
-        value = sources.get("net_profit", {}).get("value")
-        answer = f"Net Profit for {period_used} is {value}."
-    else:
-        answer = f"I can explain ROA, ROE, cost-to-income, total assets, or net profit. Period in use: {period_used}."
-
-    history = session.messages[-8:] if session.messages else []
-    try:
-        openai_payload = generate_openai_answer(
-            message=message,
-            context={
-                "entity": pack.entity or payload.entity,
-                "period": period_used,
-                "kpis": {
-                    "total_assets": sources.get("assets", {}).get("value"),
-                    "total_equity": sources.get("equity", {}).get("value"),
-                    "net_profit": sources.get("net_profit", {}).get("value"),
-                    "customers_deposits": sources.get("customers_deposits", {}).get("value"),
-                },
-                "ratios": computed.get("ratios"),
-                "evidence": evidence_list,
-                "evidence_from_drawer": payload.evidence_context or [],
+    except HTTPException:
+        raise
+    except Exception as exc:
+        AI_LOGGER.exception("Unhandled /chat/message error (%s): %s", exc.__class__.__name__, str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "chat_internal_error",
+                "detail": "Chat request failed unexpectedly. Please retry.",
+                "error_type": exc.__class__.__name__,
             },
-            history=history,
-        )
-    except AIProviderError as exc:
-        raise HTTPException(status_code=502, detail={"error": "ai_provider_error", "detail": exc.detail}) from exc
-    except json.JSONDecodeError as exc:
-        AI_LOGGER.exception("OpenAI response parsing failed (%s): %s", exc.__class__.__name__, str(exc))
-        raise HTTPException(
-            status_code=502,
-            detail={"error": "ai_provider_error", "detail": "invalid JSON returned by AI provider"},
         ) from exc
-
-    if isinstance(openai_payload.get("answer"), str):
-        answer = openai_payload["answer"]
-        citations = openai_payload.get("citations") or citations
-        data_backed = bool(openai_payload.get("data_backed"))
-    else:
-        raise HTTPException(
-            status_code=502,
-            detail={"error": "ai_provider_error", "detail": "missing answer field in AI response"},
-        )
-
-    summary = {
-        "executive_summary": f"Summary for {period_used} based on latest uploaded pack.",
-        "key_kpis": {
-            "total_assets": sources.get("assets", {}).get("value"),
-            "total_equity": sources.get("equity", {}).get("value"),
-            "net_profit": sources.get("net_profit", {}).get("value"),
-        },
-        "profitability": {
-            "roa": computed.get("ratios", {}).get("roa"),
-            "roe": computed.get("ratios", {}).get("roe"),
-        },
-        "efficiency": {
-            "cost_to_income": computed.get("ratios", {}).get("cost_to_income"),
-        },
-        "balance_sheet": {
-            "total_assets": sources.get("assets", {}).get("value"),
-            "total_equity": sources.get("equity", {}).get("value"),
-        },
-        "risks": ["Review expense structure if cost-to-income is elevated."],
-        "evidence": citations,
-    }
-
-    CHAT_STORE.add_message(payload.session_id, "assistant", answer)
-    session.memory.update(
-        {
-            "entity": payload.entity,
-            "period": period_used,
-            "scenario": payload.scenario,
-            "last_metrics": used_metrics,
-        }
-    )
-    return {
-        "session_id": payload.session_id,
-        "answer": answer,
-        "summary": summary,
-        "interpretation": interpretation_structured,
-        "citations": citations,
-        "data_backed": data_backed,
-        "used_period": period_used,
-        "used_metrics": used_metrics,
-    }
 
 
 @app.get("/exports/board-pack")
-def export_board_pack() -> Response:
+def export_board_pack(_: str = Depends(require_roles("view_exec_governance"))) -> Response:
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
@@ -764,253 +881,267 @@ def export_board_pack() -> Response:
     except Exception:
         raise HTTPException(status_code=500, detail="PDF export requires reportlab. Install it and restart the backend.")
 
-    pack = PACK_STORE.get_latest_pack()
-    if not pack or not pack.periods:
-        raise HTTPException(status_code=400, detail="No pack available to export")
+    try:
+        pack = PACK_STORE.get_latest_pack()
+        if not pack or not pack.periods:
+            raise HTTPException(status_code=400, detail="No pack available to export")
 
-    period = pack.periods[-1]
-    previous_period = pack.periods[-2] if len(pack.periods) > 1 else period
-    computed = compute_ratios({"facts": pack.normalized_facts, "periods": pack.periods}, period)
-    ratios = computed.get("ratios", {})
-    sources = computed.get("sources", {})
-    entity_name = pack.entity or "Executive Summary"
-    variance = compute_variance(
-        {"facts": pack.normalized_facts, "periods": pack.periods},
-        previous_period,
-        period,
-    )
-    interpretation = generate_openai_interpretation(
-        entity_name=entity_name,
-        period=period,
-        assets=sources.get("assets", {}).get("value"),
-        equity=sources.get("equity", {}).get("value"),
-        net_profit=sources.get("net_profit", {}).get("value"),
-        roa=ratios.get("roa"),
-        roe=ratios.get("roe"),
-        cti=ratios.get("cost_to_income"),
-    )
-
-    def fmt(value: Any) -> str:
-        return _format_million(value)
-
-    def fmt_pct(value: Any) -> str:
-        if value is None or not isinstance(value, (int, float)):
-            return "—"
-        return f"{value * 100:.2f}%"
-
-    summary_lines = [
-        f"Entity: {entity_name}",
-        f"Period: {period}",
-        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        "",
-        "Executive Summary:",
-        f"- Total Assets: {fmt(sources.get('assets', {}).get('value'))} AED",
-        f"- Total Equity: {fmt(sources.get('equity', {}).get('value'))} AED",
-        f"- Net Profit: {fmt(sources.get('net_profit', {}).get('value'))} AED",
-        "",
-        "Profitability:",
-        f"- ROA (annualized): {fmt_pct(ratios.get('roa'))}",
-        f"- ROE (annualized): {fmt_pct(ratios.get('roe'))}",
-        "",
-        "Efficiency:",
-        f"- Cost-to-Income: {fmt_pct(ratios.get('cost_to_income'))}",
-    ]
-
-    interpretation_lines = ["", "Structured Interpretation:"]
-    if interpretation:
-        interpretation_lines.extend(
-            [
-                f"- Executive Summary: {interpretation.get('executive_summary')}",
-                f"- Profitability: {interpretation.get('profitability')}",
-                f"- Efficiency: {interpretation.get('efficiency')}",
-                f"- Balance Sheet: {interpretation.get('balance_sheet')}",
-                f"- Risks / Focus: {'; '.join(interpretation.get('risks') or [])}",
-            ]
+        period = pack.periods[-1]
+        previous_period = pack.periods[-2] if len(pack.periods) > 1 else period
+        computed = compute_ratios({"facts": pack.normalized_facts, "periods": pack.periods}, period)
+        ratios = computed.get("ratios", {})
+        sources = computed.get("sources", {})
+        entity_name = pack.entity or "Executive Summary"
+        variance = compute_variance(
+            {"facts": pack.normalized_facts, "periods": pack.periods},
+            previous_period,
+            period,
         )
-    else:
-        interpretation_lines.append("- Interpretation not available (missing OpenAI API key).")
+        interpretation = generate_openai_interpretation(
+            entity_name=entity_name,
+            period=period,
+            assets=sources.get("assets", {}).get("value"),
+            equity=sources.get("equity", {}).get("value"),
+            net_profit=sources.get("net_profit", {}).get("value"),
+            roa=ratios.get("roa"),
+            roe=ratios.get("roe"),
+            cti=ratios.get("cost_to_income"),
+        )
+        def fmt(value: Any) -> str:
+            return _format_million(value)
 
-    variance_lines = [
-        "",
-        "Variance Bridge:",
-        f"- Start Net Profit ({variance.get('period_from')}): {fmt(variance.get('start', {}).get('value'))} AED",
-    ]
-    for item in variance.get("bridge", []):
+        def fmt_pct(value: Any) -> str:
+            if value is None or not isinstance(value, (int, float)):
+                return "—"
+            return f"{value * 100:.2f}%"
+
+        summary_lines = [
+            f"Entity: {entity_name}",
+            f"Period: {period}",
+            f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+            "",
+            "Executive Summary:",
+            f"- Total Assets: {fmt(sources.get('assets', {}).get('value'))} AED",
+            f"- Total Equity: {fmt(sources.get('equity', {}).get('value'))} AED",
+            f"- Net Profit: {fmt(sources.get('net_profit', {}).get('value'))} AED",
+            "",
+            "Profitability:",
+            f"- ROA (annualized): {fmt_pct(ratios.get('roa'))}",
+            f"- ROE (annualized): {fmt_pct(ratios.get('roe'))}",
+            "",
+            "Efficiency:",
+            f"- Cost-to-Income: {fmt_pct(ratios.get('cost_to_income'))}",
+        ]
+
+        interpretation_lines = ["", "Structured Interpretation:"]
+        if interpretation:
+            interpretation_lines.extend(
+                [
+                    f"- Executive Summary: {interpretation.get('executive_summary')}",
+                    f"- Profitability: {interpretation.get('profitability')}",
+                    f"- Efficiency: {interpretation.get('efficiency')}",
+                    f"- Balance Sheet: {interpretation.get('balance_sheet')}",
+                    f"- Risks / Focus: {'; '.join(interpretation.get('risks') or [])}",
+                ]
+            )
+        else:
+            interpretation_lines.append("- Interpretation not available (missing OpenAI API key).")
+
+        variance_lines = [
+            "",
+            "Variance Bridge:",
+            f"- Start Net Profit ({variance.get('period_from')}): {fmt(variance.get('start', {}).get('value'))} AED",
+        ]
+        for item in variance.get("bridge", []):
+            variance_lines.append(
+                f"- {item.get('label')}: {fmt(item.get('delta'))} AED (Running: {fmt(item.get('running_total'))} AED)"
+            )
         variance_lines.append(
-            f"- {item.get('label')}: {fmt(item.get('delta'))} AED (Running: {fmt(item.get('running_total'))} AED)"
-        )
-    variance_lines.append(
-        f"- End Net Profit ({variance.get('period_to')}): {fmt(variance.get('end', {}).get('value'))} AED"
-    )
-
-    evidence_lines = ["", "Evidence Table:"]
-    for key, src in sources.items():
-        if not src:
-            continue
-        lineage = src.get("lineage", {}) if isinstance(src, dict) else {}
-        evidence_lines.append(
-            f"- {key}: {fmt(src.get('value'))} AED | {src.get('line_item')} | "
-            f"Sheet {lineage.get('sheet')} Row {lineage.get('row_index')} Col {lineage.get('column')} | {src.get('period')}"
+            f"- End Net Profit ({variance.get('period_to')}): {fmt(variance.get('end', {}).get('value'))} AED"
         )
 
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=letter,
-        leftMargin=0.7 * inch,
-        rightMargin=0.7 * inch,
-        topMargin=0.7 * inch,
-        bottomMargin=0.7 * inch,
-    )
+        evidence_lines = ["", "Evidence Table:"]
+        for key, src in sources.items():
+            if not src:
+                continue
+            lineage = src.get("lineage", {}) if isinstance(src, dict) else {}
+            evidence_lines.append(
+                f"- {key}: {fmt(src.get('value'))} AED | {src.get('line_item')} | "
+                f"Sheet {lineage.get('sheet')} Row {lineage.get('row_index')} Col {lineage.get('column')} | {src.get('period')}"
+            )
 
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "Title",
-        parent=styles["Title"],
-        fontName="Helvetica-Bold",
-        fontSize=20,
-        textColor=colors.HexColor("#0B1A2B"),
-        spaceAfter=12,
-    )
-    h2 = ParagraphStyle(
-        "H2",
-        parent=styles["Heading2"],
-        fontName="Helvetica-Bold",
-        fontSize=13,
-        textColor=colors.HexColor("#0B1A2B"),
-        spaceBefore=10,
-        spaceAfter=6,
-    )
-    body = ParagraphStyle(
-        "Body",
-        parent=styles["BodyText"],
-        fontName="Helvetica",
-        fontSize=10.5,
-        leading=14,
-        textColor=colors.HexColor("#1B2430"),
-    )
-    subtle = ParagraphStyle(
-        "Subtle",
-        parent=styles["BodyText"],
-        fontName="Helvetica",
-        fontSize=9.5,
-        leading=13,
-        textColor=colors.HexColor("#5B6B7A"),
-    )
-
-    story = []
-    story.append(Paragraph("Finance Hub — Board Pack", title_style))
-    story.append(Paragraph(f"<b>Entity:</b> {entity_name}  &nbsp;&nbsp; <b>Period:</b> {period}", body))
-    story.append(Paragraph(f"<b>Generated:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", subtle))
-    story.append(Spacer(1, 12))
-
-    story.append(Paragraph("Executive Summary", h2))
-    for line in summary_lines[4:]:
-        story.append(Paragraph(line.replace("- ", "• "), body))
-    story.append(Spacer(1, 12))
-
-    story.append(Paragraph("Structured Interpretation (CFO)", h2))
-    for line in interpretation_lines[1:]:
-        story.append(Paragraph(line.replace("- ", "• "), body))
-    story.append(Spacer(1, 12))
-
-    story.append(Paragraph("Key KPIs & Ratios", h2))
-    kpi_table = [
-        ["Metric", "Value"],
-        ["Total Assets", _format_million(sources.get("assets", {}).get("value"))],
-        ["Total Equity", _format_million(sources.get("equity", {}).get("value"))],
-        ["Net Profit", _format_million(sources.get("net_profit", {}).get("value"))],
-        ["ROA (annualized)", fmt_pct(ratios.get("roa"))],
-        ["ROE (annualized)", fmt_pct(ratios.get("roe"))],
-        ["Cost-to-Income", fmt_pct(ratios.get("cost_to_income"))],
-    ]
-    kpi_tbl = Table(kpi_table, colWidths=[3.2 * inch, 2.2 * inch])
-    kpi_tbl.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1A2B")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6DCE5")),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F7F9FC")),
-            ]
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            leftMargin=0.7 * inch,
+            rightMargin=0.7 * inch,
+            topMargin=0.7 * inch,
+            bottomMargin=0.7 * inch,
         )
-    )
-    story.append(kpi_tbl)
-    story.append(PageBreak())
 
-    story.append(Paragraph("Variance Bridge", h2))
-    variance_table = [
-        ["Driver", "Delta (M AED)", "Running (M AED)"],
-    ]
-    for item in variance.get("bridge", []):
-        variance_table.append(
-            [
-                item.get("label"),
-                _format_million(item.get("delta")).replace(" AED", ""),
-                _format_million(item.get("running_total")).replace(" AED", ""),
-            ]
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            "Title",
+            parent=styles["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=20,
+            textColor=colors.HexColor("#0B1A2B"),
+            spaceAfter=12,
         )
-    var_tbl = Table(variance_table, colWidths=[3.2 * inch, 1.4 * inch, 1.4 * inch])
-    var_tbl.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1A2B")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6DCE5")),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-            ]
+        h2 = ParagraphStyle(
+            "H2",
+            parent=styles["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=13,
+            textColor=colors.HexColor("#0B1A2B"),
+            spaceBefore=10,
+            spaceAfter=6,
         )
-    )
-    story.append(Paragraph(f"Start Net Profit: {_format_million(variance.get('start', {}).get('value'))}", body))
-    story.append(Spacer(1, 6))
-    story.append(var_tbl)
-    story.append(Spacer(1, 6))
-    story.append(Paragraph(f"End Net Profit: {_format_million(variance.get('end', {}).get('value'))}", body))
-    story.append(PageBreak())
+        body = ParagraphStyle(
+            "Body",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=10.5,
+            leading=14,
+            textColor=colors.HexColor("#1B2430"),
+        )
+        subtle = ParagraphStyle(
+            "Subtle",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=9.5,
+            leading=13,
+            textColor=colors.HexColor("#5B6B7A"),
+        )
 
-    story.append(Paragraph("Evidence Table", h2))
-    evidence_table = [["Metric", "Value (M AED)", "Line Item", "Sheet", "Row", "Col", "Period"]]
-    for key, src in sources.items():
-        if not src:
-            continue
-        lineage = src.get("lineage", {})
-        evidence_table.append(
-            [
-                key,
-                _format_million(src.get("value")).replace(" AED", ""),
-                src.get("line_item") or "—",
-                lineage.get("sheet") or "—",
-                lineage.get("row_index") if lineage.get("row_index") is not None else "—",
-                lineage.get("column") or "—",
-                src.get("period") or "—",
-            ]
-        )
-    ev_tbl = Table(evidence_table, colWidths=[1.2 * inch, 1.0 * inch, 2.0 * inch, 0.7 * inch, 0.6 * inch, 0.6 * inch, 1.0 * inch])
-    ev_tbl.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1A2B")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6DCE5")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
-    story.append(ev_tbl)
+        story = []
+        story.append(Paragraph("Finance Hub — Board Pack", title_style))
+        story.append(Paragraph(f"<b>Entity:</b> {entity_name}  &nbsp;&nbsp; <b>Period:</b> {period}", body))
+        story.append(Paragraph(f"<b>Generated:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", subtle))
+        story.append(Spacer(1, 12))
 
-    doc.build(story)
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
+        story.append(Paragraph("Executive Summary", h2))
+        for line in summary_lines[4:]:
+            story.append(Paragraph(line.replace("- ", "• "), body))
+        story.append(Spacer(1, 12))
 
-    filename = f"board-pack-{pack.upload_id}.pdf"
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+        story.append(Paragraph("Structured Interpretation (CFO)", h2))
+        for line in interpretation_lines[1:]:
+            story.append(Paragraph(line.replace("- ", "• "), body))
+        story.append(Spacer(1, 12))
+
+        story.append(Paragraph("Key KPIs & Ratios", h2))
+        kpi_table = [
+            ["Metric", "Value"],
+            ["Total Assets", _format_million(sources.get("assets", {}).get("value"))],
+            ["Total Equity", _format_million(sources.get("equity", {}).get("value"))],
+            ["Net Profit", _format_million(sources.get("net_profit", {}).get("value"))],
+            ["ROA (annualized)", fmt_pct(ratios.get("roa"))],
+            ["ROE (annualized)", fmt_pct(ratios.get("roe"))],
+            ["Cost-to-Income", fmt_pct(ratios.get("cost_to_income"))],
+        ]
+        kpi_tbl = Table(kpi_table, colWidths=[3.2 * inch, 2.2 * inch])
+        kpi_tbl.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1A2B")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6DCE5")),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F7F9FC")),
+                ]
+            )
+        )
+        story.append(kpi_tbl)
+        story.append(PageBreak())
+
+        story.append(Paragraph("Variance Bridge", h2))
+        variance_table = [
+            ["Driver", "Delta (M AED)", "Running (M AED)"],
+        ]
+        for item in variance.get("bridge", []):
+            variance_table.append(
+                [
+                    item.get("label"),
+                    _format_million(item.get("delta")).replace(" AED", ""),
+                    _format_million(item.get("running_total")).replace(" AED", ""),
+                ]
+            )
+        var_tbl = Table(variance_table, colWidths=[3.2 * inch, 1.4 * inch, 1.4 * inch])
+        var_tbl.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1A2B")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6DCE5")),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                ]
+            )
+        )
+        story.append(Paragraph(f"Start Net Profit: {_format_million(variance.get('start', {}).get('value'))}", body))
+        story.append(Spacer(1, 6))
+        story.append(var_tbl)
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"End Net Profit: {_format_million(variance.get('end', {}).get('value'))}", body))
+        story.append(PageBreak())
+
+        story.append(Paragraph("Evidence Table", h2))
+        evidence_table = [["Metric", "Value (M AED)", "Line Item", "Sheet", "Row", "Col", "Period"]]
+        for key, src in sources.items():
+            if not src:
+                continue
+            lineage = src.get("lineage", {})
+            evidence_table.append(
+                [
+                    key,
+                    _format_million(src.get("value")).replace(" AED", ""),
+                    src.get("line_item") or "—",
+                    lineage.get("sheet") or "—",
+                    lineage.get("row_index") if lineage.get("row_index") is not None else "—",
+                    lineage.get("column") or "—",
+                    src.get("period") or "—",
+                ]
+            )
+        ev_tbl = Table(evidence_table, colWidths=[1.2 * inch, 1.0 * inch, 2.0 * inch, 0.7 * inch, 0.6 * inch, 0.6 * inch, 1.0 * inch])
+        ev_tbl.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1A2B")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6DCE5")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(ev_tbl)
+
+        doc.build(story)
+        pdf_bytes = buffer.getvalue()
+        buffer.close()
+        if not pdf_bytes:
+            raise HTTPException(status_code=500, detail="Generated PDF is empty")
+
+        filename = f"board-pack-{pack.upload_id}.pdf"
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        AI_LOGGER.exception("Board pack export failed (%s): %s", exc.__class__.__name__, str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "board_pack_export_failed",
+                "detail": "Board pack generation failed. Please try again.",
+                "error_type": exc.__class__.__name__,
+            },
+        ) from exc
 
 @app.get("/routes")
 def list_routes():
