@@ -75,6 +75,16 @@ export function getPeriods() {
   }>("/periods");
 }
 
+export function getLatestPack() {
+  return request<{
+    has_pack: boolean;
+    latest_upload_id: string | null;
+    entity: string | null;
+    periods: string[];
+    scenarios: string[];
+  }>("/pack/latest");
+}
+
 export function getRatios(entity: string, period: string, scenario: string) {
   const qs = new URLSearchParams({ entity, period, scenario });
   return request<any>(`/ratios?${qs.toString()}`, { cache: "no-store" });
@@ -150,6 +160,52 @@ export function sendChatMessage(
       data_backed?: boolean;
       meta?: { provider?: string; reason?: string; detail?: string };
     }> | ApiErr;
+  })();
+}
+
+export function aiInterpret(entity?: string, period?: string, scenario?: string, evidence_refs?: any[]) {
+  return request<{
+    sections: Array<{ title: string; bullets: string[]; evidenceRefs?: string[] }>;
+    plainText: string;
+    meta?: { scenario?: string; data_available?: boolean; period_used?: string };
+  }>("/ai/interpret", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entity, period, scenario, evidence_refs }),
+  });
+}
+
+export function aiChat(
+  messages: Array<{ role: string; content: string }>,
+  entity?: string,
+  period?: string,
+  scenario?: string,
+  evidence_refs?: any[],
+  retryCount: number = 1
+) {
+  const doRequest = () =>
+    request<{
+      answer: string;
+      citations: any[];
+      data_backed: boolean;
+      meta?: { reason?: string; detail?: string; period_used?: string };
+    }>("/ai/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages, entity, period, scenario, evidence_refs }),
+    });
+
+  if (retryCount <= 0) return doRequest();
+
+  return (async () => {
+    let last = await doRequest();
+    let attempts = retryCount;
+    while (!last.ok && attempts > 0 && (last.error === "NETWORK_ERROR" || last.error === "TIMEOUT_ERROR" || /temporar|timeout|unavailable/i.test(last.message))) {
+      await new Promise((resolve) => setTimeout(resolve, (retryCount - attempts + 1) * 600));
+      last = await doRequest();
+      attempts -= 1;
+    }
+    return last;
   })();
 }
 

@@ -5,9 +5,12 @@ import { useSearchParams } from "next/navigation";
 import { BarChart3, Building2, FileSpreadsheet, ShieldCheck, Users } from "lucide-react";
 import {
   API_BASE_URL,
+  aiChat,
+  aiInterpret,
   createChatSession,
   createBoardPackJob,
   downloadBoardPackJob,
+  getLatestPack,
   getPeriods,
   getBoardPackJob,
   getRatios,
@@ -323,6 +326,7 @@ function PageWithParams() {
   const [interpretationLoading, setInterpretationLoading] = React.useState<boolean>(false);
   const [exportLoading, setExportLoading] = React.useState<boolean>(false);
   const chatScrollRef = React.useRef<HTMLDivElement | null>(null);
+  const chatInputRef = React.useRef<HTMLInputElement | null>(null);
   const [theme, setTheme] = React.useState<"dark" | "light">("dark");
   const [showApiWarning, setShowApiWarning] = React.useState(false);
   const [graphOpen, setGraphOpen] = React.useState(false);
@@ -403,23 +407,23 @@ function PageWithParams() {
 
     async function loadPeriods() {
       setPeriodsLoading(true);
-      const res = await getPeriods();
+      const latestRes = await getLatestPack();
       if (cancelled) return;
 
-      if (res.ok) {
-        const sorted = [...(res.data.periods || [])].sort((a, b) => periodKey(a) - periodKey(b));
+      if (latestRes.ok) {
+        const sorted = [...(latestRes.data.periods || [])].sort((a, b) => periodKey(a) - periodKey(b));
         setPeriods(sorted);
-        setLatestUploadId(res.data.latest_upload_id || null);
-        setHasBackendPack(Boolean(res.data.has_pack));
-        if (res.data.entity) {
-          setEntity(res.data.entity);
+        setLatestUploadId(latestRes.data.latest_upload_id || null);
+        setHasBackendPack(Boolean(latestRes.data.has_pack));
+        if (latestRes.data.entity) {
+          setEntity(latestRes.data.entity);
         }
-        if (typeof window !== "undefined" && res.data.latest_upload_id) {
+        if (typeof window !== "undefined" && latestRes.data.latest_upload_id) {
           const storedPackState = window.localStorage.getItem("finance_hub_pack_state");
           if (storedPackState) {
             try {
               const parsed = JSON.parse(storedPackState);
-              if (parsed?.latest_upload_id === res.data.latest_upload_id) {
+              if (parsed?.latest_upload_id === latestRes.data.latest_upload_id) {
                 if (typeof parsed.entity === "string") setEntity(parsed.entity);
                 if (typeof parsed.period === "string" && sorted.includes(parsed.period)) setPeriod(parsed.period);
               }
@@ -441,6 +445,16 @@ function PageWithParams() {
             setPeriod(""); // no data yet
           }
           periodInitialized.current = true;
+        }
+      }
+      if (!latestRes.ok) {
+        const res = await getPeriods();
+        if (res.ok) {
+          const sorted = [...(res.data.periods || [])].sort((a, b) => periodKey(a) - periodKey(b));
+          setPeriods(sorted);
+          setLatestUploadId(res.data.latest_upload_id || null);
+          setHasBackendPack(Boolean(res.data.has_pack));
+          if (res.data.entity) setEntity(res.data.entity);
         }
       }
 
@@ -510,6 +524,10 @@ function PageWithParams() {
         if (res.data?.entity && res.data.entity !== entity) {
           setEntity(res.data.entity);
         }
+        if (res.data?.scenario_available === false && res.data?.scenario_note) {
+          setToast({ type: "error", message: res.data.scenario_note });
+          setTimeout(() => setToast(null), 2500);
+        }
         setLiveStatus("connected");
       } else {
         setData(null);
@@ -552,6 +570,7 @@ function PageWithParams() {
     if (node) {
       node.scrollTop = node.scrollHeight;
     }
+    setTimeout(() => chatInputRef.current?.focus(), 0);
   }, [chatMessages, chatOpen]);
 
   async function handleExcelUpload(file: File) {
@@ -759,8 +778,14 @@ function PageWithParams() {
 
     try {
       setChatLoading(true);
-      const sessionId = await ensureChatSession();
-      const res = await sendChatMessage(sessionId, text, entity, period || "", scenario, evidenceContext, 1);
+      const historyPayload = chatMessages.slice(-8).map((m) => ({ role: m.role, content: m.content }));
+      const res = await aiChat(
+        [...historyPayload, { role: "user", content: text }],
+        entity,
+        period || "",
+        scenario,
+        evidenceContext
+      );
       if (res.ok) {
         setChatMessages((prev) => [
           ...prev,
@@ -768,7 +793,6 @@ function PageWithParams() {
             role: "assistant",
             content: "",
             citations: res.data.citations as EvidenceItem[],
-            summary: res.data.summary,
             data_backed: res.data.data_backed,
           },
         ]);
@@ -815,6 +839,7 @@ function PageWithParams() {
       setTimeout(() => setToast(null), 3000);
     } finally {
       setChatLoading(false);
+      setTimeout(() => chatInputRef.current?.focus(), 0);
     }
   }
 
@@ -850,18 +875,39 @@ function PageWithParams() {
     }
     try {
       setInterpretationLoading(true);
-      const sessionId = await ensureChatSession();
-      const prompt =
-        "Provide a CFO-grade interpretation as clean JSON only (no markdown). Keys required: executive_summary, profitability, efficiency, balance_sheet, risks (array). Include ROA/ROE/net profit drivers, cost-to-income commentary, and balance-sheet focus points.";
-      const res = await sendChatMessage(sessionId, prompt, entity, period, scenario, undefined, 1);
+      const res = await aiInterpret(entity, period, scenario);
       if (typeof window !== "undefined") {
         console.debug("[finance-hub] interpretation payload", res);
       }
       if (res.ok) {
-        const payload = hasInterpretationContent(res.data.interpretation)
-          ? normalizeInterpretationPayload(res.data.interpretation)
-          : normalizeInterpretationPayload(null, res.data.answer);
-        setInterpretationData(payload);
+        const mapByTitle = new Map<string, string>();
+        const risks: string[] = [];
+        (res.data.sections || []).forEach((section: any) => {
+          const title = String(section?.title || "").toLowerCase();
+          const bullets = Array.isArray(section?.bullets) ? section.bullets : [];
+          const text = bullets.join("\n");
+          if (title.includes("executive")) mapByTitle.set("executive_summary", text);
+          if (title.includes("profit")) mapByTitle.set("profitability", text);
+          if (title.includes("efficiency")) mapByTitle.set("efficiency", text);
+          if (title.includes("balance")) mapByTitle.set("balance_sheet", text);
+          if (title.includes("risk")) risks.push(...bullets);
+          if (title.includes("recommended")) mapByTitle.set("recommended_actions", text);
+          if (title.includes("liquidity")) mapByTitle.set("liquidity_concentration", text);
+        });
+        setInterpretationData(
+          normalizeInterpretationPayload(
+            {
+              executive_summary: mapByTitle.get("executive_summary") || res.data.plainText,
+              profitability: mapByTitle.get("profitability") || "Not available in this pack",
+              efficiency: mapByTitle.get("efficiency") || "Not available in this pack",
+              balance_sheet: mapByTitle.get("balance_sheet") || "Not available in this pack",
+              risks: risks.length ? risks : ["Not available in this pack"],
+              recommended_actions: mapByTitle.get("recommended_actions") || "Not available in this pack",
+              liquidity_concentration: mapByTitle.get("liquidity_concentration") || "Not available in this pack",
+            },
+            res.data.plainText
+          )
+        );
       } else {
         setInterpretationData(normalizeInterpretationPayload(null, res.message || "No interpretation available."));
       }
@@ -1322,6 +1368,17 @@ function PageWithParams() {
                     Theme: {theme === "dark" ? "Dark" : "Light"}
                   </button>
 
+                  <button
+                    className={cn("whitespace-nowrap", buttonGhost)}
+                    onClick={() => {
+                      if (typeof window !== "undefined") {
+                        window.location.href = "/role-select";
+                      }
+                    }}
+                  >
+                    Switch Role
+                  </button>
+
                   {canSeeExports ? (
                     <div className="relative">
                       <button
@@ -1645,6 +1702,14 @@ function PageWithParams() {
                             <div className="mt-2">{renderStructuredContent(interpretationData.balance_sheet)}</div>
                           </div>
                           <div className={cn("rounded-2xl border p-4 text-sm", cardInner)}>
+                            <div className={cn("text-xs font-semibold", panelMuted)}>Liquidity & Concentration</div>
+                            <div className="mt-2">{renderStructuredContent((interpretationData as any).liquidity_concentration)}</div>
+                          </div>
+                          <div className={cn("rounded-2xl border p-4 text-sm md:col-span-2", cardInner)}>
+                            <div className={cn("text-xs font-semibold", panelMuted)}>Recommended Actions (30/60/90 days)</div>
+                            <div className="mt-2">{renderStructuredContent((interpretationData as any).recommended_actions)}</div>
+                          </div>
+                          <div className={cn("rounded-2xl border p-4 text-sm", cardInner)}>
                             <div className={cn("text-xs font-semibold", panelMuted)}>Risks & Focus</div>
                             <div className="mt-2">
                               {(interpretationData.risks || []).length ? (
@@ -1841,12 +1906,12 @@ function PageWithParams() {
         />
 
         {canSeeChat ? (
-          <div className="fixed bottom-6 right-6 z-40">
+          <div className="fixed bottom-6 right-6 z-40 pointer-events-auto">
             {chatOpen ? (
               <div className={chatPanel}>
-                <div className={cn("flex items-center justify-between border-b px-4 py-3", isLight ? "border-slate-200" : "border-white/10")}>
+                <div className={cn("sticky top-0 z-10 flex items-center justify-between border-b px-4 py-3", isLight ? "border-slate-200 bg-white" : "border-white/10 bg-[#0B0F1A]")}>
                   <div>
-                    <p className={cn("text-xs", chatHeader)}>Finance Hub AI</p>
+                    <p className={cn("text-xs", chatHeader)}>Fin. Assistant</p>
                     <p className={cn("text-sm", chatTitle)}>Ask about KPIs</p>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1859,7 +1924,7 @@ function PageWithParams() {
                   </div>
                 </div>
 
-                <div className={cn("space-y-2 border-b px-4 py-3 text-xs", isLight ? "border-slate-200" : "border-white/10")}>
+                <div className={cn("space-y-2 border-b px-4 py-3 text-xs", isLight ? "border-slate-200 bg-white" : "border-white/10 bg-[#0B0F1A]")}>
                   <div className="flex flex-wrap gap-2">
                     {[
                       { label: "Explain ROA", msg: "Explain ROA" },
@@ -1960,8 +2025,9 @@ function PageWithParams() {
                   )}
                 </div>
 
-                <div className={cn("flex items-center gap-2 border-t px-3 py-3", isLight ? "border-slate-200" : "border-white/10")}>
+                <div className={cn("sticky bottom-0 z-10 flex items-center gap-2 border-t px-3 py-3", isLight ? "border-slate-200 bg-white" : "border-white/10 bg-[#0B0F1A]")}>
                   <input
+                    ref={chatInputRef}
                     className={chatInputClass}
                     placeholder="Ask about ROA, ROE, or net profit..."
                     value={chatInput}
@@ -1984,7 +2050,7 @@ function PageWithParams() {
                 )}
                 onClick={() => setChatOpen(true)}
               >
-                AI Assistant
+                Fin. Assistant
               </button>
             )}
           </div>

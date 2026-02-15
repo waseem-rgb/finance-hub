@@ -135,6 +135,160 @@ def _job_create() -> str:
     return job_id
 
 
+def _normalize_scenario_name(scenario: Optional[str]) -> str:
+    value = (scenario or "Actual").strip().lower()
+    if value in {"actual", "budget", "forecast", "stress"}:
+        return value
+    return "actual"
+
+
+def _detect_fact_scenario(fact: dict) -> str:
+    statement = str(fact.get("statement") or "").lower()
+    line_item = str(fact.get("line_item") or "").lower()
+    joined = f"{statement} {line_item}"
+    if "budget" in joined:
+        return "budget"
+    if "forecast" in joined or "fcst" in joined:
+        return "forecast"
+    if "stress" in joined:
+        return "stress"
+    return "actual"
+
+
+def _build_scenario_normalized(pack: Any, scenario: Optional[str]) -> dict:
+    normalized_scenario = _normalize_scenario_name(scenario)
+    facts = pack.normalized_facts or []
+    selected_facts = [fact for fact in facts if _detect_fact_scenario(fact) == normalized_scenario]
+    periods = sorted({str(fact.get("period")) for fact in selected_facts if fact.get("period")})
+    return {"facts": selected_facts, "periods": periods}
+
+
+def _available_scenarios(pack: Any) -> list[str]:
+    scenarios = {_detect_fact_scenario(fact) for fact in (pack.normalized_facts or [])}
+    ordered = [s for s in ["actual", "budget", "forecast", "stress"] if s in scenarios]
+    return [s.title() for s in ordered]
+
+
+def _source_ref(source: Optional[dict]) -> str:
+    if not source:
+        return "Not available in this pack"
+    lineage = source.get("lineage", {})
+    return (
+        f"{source.get('statement') or '-'} | "
+        f"Sheet {lineage.get('sheet') or '-'} | "
+        f"Row {lineage.get('row_index') if lineage.get('row_index') is not None else '-'} | "
+        f"Col {lineage.get('column') or '-'} | "
+        f"{source.get('period') or '-'}"
+    )
+
+
+def _build_interpretation_sections(entity_name: str, period: Optional[str], computed: dict) -> dict:
+    ratios = computed.get("ratios", {})
+    sources = computed.get("sources", {})
+
+    def pct(v: Any) -> str:
+        if isinstance(v, (int, float)):
+            return f"{v * 100:.2f}%"
+        return "Not available in this pack"
+
+    def money(v: Any) -> str:
+        if isinstance(v, (int, float)):
+            return f"{v / 1_000_000:.2f} M AED"
+        return "Not available in this pack"
+
+    roa = ratios.get("roa")
+    roe = ratios.get("roe")
+    cti = ratios.get("cost_to_income")
+    assets = sources.get("assets", {}).get("value") if sources.get("assets") else None
+    equity = sources.get("equity", {}).get("value") if sources.get("equity") else None
+    deposits = sources.get("customers_deposits", {}).get("value") if sources.get("customers_deposits") else None
+    net_profit = sources.get("net_profit", {}).get("value") if sources.get("net_profit") else None
+
+    sections = [
+        {
+            "title": "Executive Summary",
+            "bullets": [
+                f"Entity: {entity_name}",
+                f"Period: {period or 'Not available in this pack'}",
+                f"Net Profit: {money(net_profit)}",
+                f"ROA: {pct(roa)} | ROE: {pct(roe)} | Cost-to-Income: {pct(cti)}",
+            ],
+            "evidenceRefs": [_source_ref(sources.get("net_profit")), _source_ref(sources.get("assets"))],
+        },
+        {
+            "title": "Profitability",
+            "bullets": [
+                f"ROA is {pct(roa)} and ROE is {pct(roe)}.",
+                f"Net profit stands at {money(net_profit)}.",
+                "Key drivers should be interpreted against income momentum and cost normalization.",
+            ],
+            "evidenceRefs": [_source_ref(sources.get("net_profit")), _source_ref(sources.get("equity"))],
+        },
+        {
+            "title": "Efficiency",
+            "bullets": [
+                f"Cost-to-income is {pct(cti)}.",
+                "Operating expense commentary should focus on controllable opex and revenue quality.",
+            ],
+            "evidenceRefs": [_source_ref(sources.get("operating_expenses")), _source_ref(sources.get("total_income"))],
+        },
+        {
+            "title": "Balance Sheet & Funding",
+            "bullets": [
+                f"Total assets: {money(assets)}.",
+                f"Total equity: {money(equity)}.",
+                f"Customer deposits: {money(deposits)}.",
+                "Funding risk should be reviewed for concentration and rollover sensitivity.",
+            ],
+            "evidenceRefs": [
+                _source_ref(sources.get("assets")),
+                _source_ref(sources.get("equity")),
+                _source_ref(sources.get("customers_deposits")),
+            ],
+        },
+        {
+            "title": "Liquidity & Concentration",
+            "bullets": [
+                "Liquidity metrics are not fully available in this pack unless cashflow/liquidity schedules are provided.",
+                "Concentration risk should be monitored for depositor and sector exposures.",
+            ],
+            "evidenceRefs": [],
+        },
+        {
+            "title": "Key Risks & Watchouts",
+            "bullets": [
+                "Monitor margin pressure if income growth lags expense growth.",
+                "Watch credit-quality proxies and impairment trend for early stress signals.",
+                "Validate data completeness for scenario-specific analysis.",
+            ],
+            "evidenceRefs": [_source_ref(sources.get("operating_expenses")), _source_ref(sources.get("net_profit"))],
+        },
+        {
+            "title": "Recommended Actions",
+            "bullets": [
+                "30 days: validate data lineage, reconcile top KPI drivers, and confirm scenario coverage.",
+                "60 days: deep-dive cost drivers and optimize controllable opex.",
+                "90 days: execute funding and balance-sheet optimization plan with board-level checkpoints.",
+            ],
+            "evidenceRefs": [],
+        },
+        {
+            "title": "Evidence Links",
+            "bullets": [
+                f"Net Profit: {_source_ref(sources.get('net_profit'))}",
+                f"Total Assets: {_source_ref(sources.get('assets'))}",
+                f"Total Equity: {_source_ref(sources.get('equity'))}",
+                f"Deposits: {_source_ref(sources.get('customers_deposits'))}",
+                f"Operating Expenses: {_source_ref(sources.get('operating_expenses'))}",
+                f"Total Income: {_source_ref(sources.get('total_income'))}",
+            ],
+            "evidenceRefs": [],
+        },
+    ]
+    plain_text = "\n".join([f"{section['title']}: " + " ".join(section["bullets"]) for section in sections])
+    return {"sections": sections, "plainText": plain_text}
+
+
 class AIProviderError(Exception):
     def __init__(self, detail: str):
         super().__init__(detail)
@@ -333,8 +487,19 @@ def ratios(
     if pack:
         try:
             entity_out = pack.entity or entity
+            scenario_normalized = _normalize_scenario_name(scenario)
+            scenario_normalized_data = _build_scenario_normalized(pack, scenario_normalized)
+            if scenario_normalized_data["facts"]:
+                normalized_payload = scenario_normalized_data
+                scenario_note = None
+            elif scenario_normalized == "actual":
+                normalized_payload = {"facts": pack.normalized_facts, "periods": pack.periods}
+                scenario_note = None
+            else:
+                normalized_payload = {"facts": [], "periods": []}
+                scenario_note = f"No {scenario.title()} data in this pack"
             computed = compute_ratios(
-                {"facts": pack.normalized_facts, "periods": pack.periods},
+                normalized_payload,
                 period,
             )
             sources = computed.get("sources", {})
@@ -407,6 +572,8 @@ def ratios(
                 "period_used": period_used,
                 "periods": pack.periods,
                 "scenario": scenario,
+                "scenario_available": bool(scenario_note is None),
+                "scenario_note": scenario_note,
                 "computed": computed.get("computed", True),
                 "sources": {
                     "total_assets": sources.get("assets"),
@@ -645,6 +812,26 @@ def get_periods(
     }
 
 
+@app.get("/pack/latest")
+def get_latest_pack() -> Dict[str, Any]:
+    pack = PACK_STORE.get_latest_pack()
+    if not pack:
+        return {
+            "has_pack": False,
+            "latest_upload_id": None,
+            "entity": None,
+            "periods": [],
+            "scenarios": [],
+        }
+    return {
+        "has_pack": True,
+        "latest_upload_id": pack.upload_id,
+        "entity": pack.entity,
+        "periods": pack.periods,
+        "scenarios": _available_scenarios(pack),
+    }
+
+
 @app.post("/pack/clear")
 def clear_pack(_: str = Depends(require_roles("cfo_only"))) -> Dict[str, Any]:
     PACK_STORE.clear()
@@ -670,8 +857,20 @@ def get_variance(
             "evidence": {},
             "notes": "No pack uploaded yet.",
         }
+    scenario_normalized = _normalize_scenario_name(scenario)
+    scenario_payload = _build_scenario_normalized(pack, scenario_normalized)
+    if not scenario_payload["facts"] and scenario_normalized != "actual":
+        return {
+            "entity": pack.entity or entity,
+            "period_from": period_from,
+            "period_to": period_to,
+            "scenario": scenario,
+            "bridge": [],
+            "evidence": {},
+            "notes": f"No {scenario.title()} data in this pack.",
+        }
     result = compute_variance(
-        {"facts": pack.normalized_facts, "periods": pack.periods},
+        scenario_payload if scenario_payload["facts"] else {"facts": pack.normalized_facts, "periods": pack.periods},
         period_from,
         period_to,
     )
@@ -702,6 +901,21 @@ class ChatMessageRequest(BaseModel):
     evidence_context: Optional[list[dict]] = None
 
 
+class AIInterpretRequest(BaseModel):
+    entity: Optional[str] = None
+    period: Optional[str] = None
+    scenario: Optional[str] = "Actual"
+    evidence_refs: Optional[list[dict]] = None
+
+
+class AIChatRequest(BaseModel):
+    messages: list[dict]
+    entity: Optional[str] = None
+    period: Optional[str] = None
+    scenario: Optional[str] = "Actual"
+    evidence_refs: Optional[list[dict]] = None
+
+
 @app.post("/chat/session")
 def create_chat_session(
     _: ChatSessionRequest = Body(default={}),
@@ -710,6 +924,197 @@ def create_chat_session(
     session = CHAT_STORE.create_session()
     session.memory["role"] = role
     return {"session_id": session.session_id}
+
+
+@app.post("/ai/interpret")
+def ai_interpret(
+    payload: AIInterpretRequest,
+) -> Dict[str, Any]:
+    pack = PACK_STORE.get_latest_pack()
+    if not pack:
+        raise HTTPException(status_code=400, detail={"error": "no_pack", "detail": "No financial pack uploaded yet."})
+
+    scenario_normalized = _normalize_scenario_name(payload.scenario)
+    scenario_payload = _build_scenario_normalized(pack, scenario_normalized)
+    if not scenario_payload["facts"] and scenario_normalized != "actual":
+        return {
+            "sections": [
+                {
+                    "title": "Executive Summary",
+                    "bullets": [f"No {scenario_normalized.title()} data in this pack."],
+                    "evidenceRefs": [],
+                }
+            ],
+            "plainText": f"No {scenario_normalized.title()} data in this pack.",
+            "meta": {"scenario": scenario_normalized, "data_available": False},
+        }
+    computed = compute_ratios(
+        scenario_payload if scenario_payload["facts"] else {"facts": pack.normalized_facts, "periods": pack.periods},
+        payload.period,
+    )
+    period_used = computed.get("period_used")
+    base = _build_interpretation_sections(pack.entity or payload.entity or "Entity", period_used, computed)
+
+    if not _get_openai_api_key():
+        return {
+            "sections": base["sections"],
+            "plainText": base["plainText"],
+            "meta": {"scenario": scenario_normalized, "data_available": True, "period_used": period_used, "reason": "ai_not_configured"},
+        }
+
+    # Attempt an AI-enhanced narrative, but remain pack-grounded:
+    # - require strict JSON
+    # - instruct "Not available in this pack" when metrics/evidence are missing
+    try:
+        prompt = (
+            "You are a CFO analyst. Create a demo-ready financial interpretation.\n"
+            "Return ONLY valid JSON with keys: sections (array), plainText (string).\n"
+            "Each section item must be: {title: string, bullets: array[string], evidenceRefs: array[string]}.\n"
+            "Required section titles (use exactly):\n"
+            "1) Executive Summary\n"
+            "2) Profitability\n"
+            "3) Efficiency\n"
+            "4) Balance Sheet & Funding\n"
+            "5) Liquidity & Concentration\n"
+            "6) Key Risks & Watchouts\n"
+            "7) Recommended Actions\n"
+            "8) Evidence Links\n"
+            "Rules:\n"
+            "- Do NOT use markdown symbols like ### or ***.\n"
+            "- If data is missing, write: 'Not available in this pack'.\n"
+            "- Evidence must reference only the provided evidenceRefs strings.\n"
+            f"Context JSON: {json.dumps(base)}\n"
+        )
+        content = _openai_chat_completion(
+            [
+                {"role": "system", "content": "You write clear, conservative CFO narratives grounded strictly in provided data."},
+                {"role": "user", "content": prompt},
+            ]
+        )
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("sections"), list):
+            raise ValueError("invalid AI interpretation payload")
+        # Sanitize and ensure required shape.
+        sections_out = []
+        for section in parsed.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            title = _sanitize_markdown_text(section.get("title")) or ""
+            bullets = section.get("bullets") if isinstance(section.get("bullets"), list) else []
+            evidence_refs = section.get("evidenceRefs") if isinstance(section.get("evidenceRefs"), list) else []
+            sections_out.append(
+                {
+                    "title": title,
+                    "bullets": [_sanitize_markdown_text(b) for b in bullets if _sanitize_markdown_text(b)],
+                    "evidenceRefs": [_sanitize_markdown_text(r) for r in evidence_refs if _sanitize_markdown_text(r)],
+                }
+            )
+        plain_text = _sanitize_markdown_text(parsed.get("plainText")) or base["plainText"]
+        return {
+            "sections": sections_out or base["sections"],
+            "plainText": plain_text,
+            "meta": {"scenario": scenario_normalized, "data_available": True, "period_used": period_used, "reason": "ok"},
+        }
+    except Exception as exc:
+        AI_LOGGER.exception("AI interpretation failed (%s): %s", exc.__class__.__name__, str(exc))
+        return {
+            "sections": base["sections"],
+            "plainText": base["plainText"],
+            "meta": {"scenario": scenario_normalized, "data_available": True, "period_used": period_used, "reason": "fallback"},
+        }
+
+
+@app.post("/ai/chat")
+def ai_chat(
+    payload: AIChatRequest,
+) -> Dict[str, Any]:
+    message = ""
+    for msg in reversed(payload.messages or []):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            message = msg["content"].strip()
+            break
+    if not message:
+        raise HTTPException(status_code=400, detail={"error": "invalid_request", "detail": "No user message provided"})
+
+    pack = PACK_STORE.get_latest_pack()
+    if not pack:
+        return {
+            "answer": "No financial pack uploaded yet. Upload and normalize an Excel file first.",
+            "citations": [],
+            "data_backed": False,
+            "meta": {"reason": "no_pack"},
+        }
+
+    scenario_normalized = _normalize_scenario_name(payload.scenario)
+    scenario_payload = _build_scenario_normalized(pack, scenario_normalized)
+    if not scenario_payload["facts"] and scenario_normalized != "actual":
+        return {
+            "answer": f"No {scenario_normalized.title()} data in this pack.",
+            "citations": [],
+            "data_backed": False,
+            "meta": {"reason": "scenario_missing"},
+        }
+
+    computed = compute_ratios(
+        scenario_payload if scenario_payload["facts"] else {"facts": pack.normalized_facts, "periods": pack.periods},
+        payload.period,
+    )
+    period_used = computed.get("period_used")
+    sources = computed.get("sources", {})
+    citations = []
+    for key in ["assets", "equity", "net_profit", "customers_deposits", "total_income", "operating_expenses"]:
+        source = sources.get(key)
+        if source:
+            lineage = source.get("lineage", {})
+            citations.append(
+                {
+                    "statement": source.get("statement"),
+                    "line_item": source.get("line_item"),
+                    "value": source.get("value"),
+                    "period": source.get("period"),
+                    "sheet": lineage.get("sheet"),
+                    "row_index": lineage.get("row_index"),
+                    "col": lineage.get("column"),
+                }
+            )
+
+    history = payload.messages[-8:] if payload.messages else []
+    if not _get_openai_api_key():
+        return {
+            "answer": "AI is not configured on the server. Showing deterministic response only.",
+            "citations": citations,
+            "data_backed": True,
+            "meta": {"reason": "ai_not_configured", "period_used": period_used},
+        }
+
+    try:
+        ai_payload = generate_openai_answer(
+            message=message,
+            context={
+                "entity": pack.entity or payload.entity,
+                "period": period_used,
+                "scenario": scenario_normalized,
+                "ratios": computed.get("ratios"),
+                "evidence": citations,
+                "evidence_from_drawer": payload.evidence_refs or [],
+            },
+            history=history,
+        )
+        answer = _sanitize_markdown_text(ai_payload.get("answer")) or "No answer generated."
+        return {
+            "answer": answer,
+            "citations": ai_payload.get("citations") or citations,
+            "data_backed": bool(ai_payload.get("data_backed")),
+            "meta": {"reason": "ok", "period_used": period_used},
+        }
+    except AIProviderError as exc:
+        reason = "ai_timeout" if "timeout" in exc.detail.lower() else "ai_upstream_failure"
+        return {
+            "answer": "AI is temporarily unavailable. Please try again.",
+            "citations": citations,
+            "data_backed": True,
+            "meta": {"reason": reason, "detail": exc.detail, "period_used": period_used},
+        }
 
 
 @app.post("/chat/message")
@@ -1274,6 +1679,10 @@ def create_board_pack_job(
     background_tasks: BackgroundTasks,
     _: str = Depends(require_roles("view_exec_governance")),
 ) -> Dict[str, Any]:
+    with EXPORT_JOBS_LOCK:
+        active_jobs = sum(1 for job in EXPORT_JOBS.values() if job.get("status") in {"queued", "running"})
+    if active_jobs >= 3:
+        raise HTTPException(status_code=429, detail="Too many export jobs in progress. Please retry shortly.")
     job_id = _job_create()
     background_tasks.add_task(_run_board_pack_export_job, job_id)
     return {"job_id": job_id, "status": "queued"}
