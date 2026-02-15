@@ -1,5 +1,10 @@
-export const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const RAW_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "http://127.0.0.1:8000";
+export const API_BASE_URL = RAW_API_BASE_URL.replace(/\/+$/, "");
+
+if (typeof window !== "undefined" && process.env.NODE_ENV !== "production") {
+  // Dev-only startup diagnostic for confirming resolved API target.
+  console.info("[finance-hub] API_BASE_URL:", API_BASE_URL);
+}
 
 type ApiOk<T> = { ok: true; data: T };
 type ApiErr = { ok: false; error: string; message: string };

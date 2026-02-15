@@ -37,14 +37,26 @@ export default function MetricGraphDrawer(props: MetricGraphDrawerProps) {
 
   React.useEffect(() => {
     if (!open) return;
+    const scrollY = window.scrollY;
+    const prevOverflow = document.body.style.overflow;
+    const prevPosition = document.body.style.position;
+    const prevTop = document.body.style.top;
+    const prevWidth = document.body.style.width;
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     document.addEventListener("keydown", handler);
     document.body.style.overflow = "hidden";
+    document.body.style.position = "fixed";
+    document.body.style.top = `-${scrollY}px`;
+    document.body.style.width = "100%";
     return () => {
       document.removeEventListener("keydown", handler);
-      document.body.style.overflow = "";
+      document.body.style.overflow = prevOverflow;
+      document.body.style.position = prevPosition;
+      document.body.style.top = prevTop;
+      document.body.style.width = prevWidth;
+      window.scrollTo(0, scrollY);
     };
   }, [open, onClose]);
 
@@ -65,26 +77,29 @@ export default function MetricGraphDrawer(props: MetricGraphDrawerProps) {
       ? "bg-[#0B0F1A] border-white/10 text-white/90"
       : "bg-white border-slate-200 text-slate-900";
 
+  if (!mounted || !open) return null;
+
   return createPortal(
-    <div className="fixed inset-0 z-50">
-      <div className="fixed inset-0 bg-black/40 backdrop-blur-[2px]" onClick={onClose} />
+    <div className="fixed inset-0 z-[90]">
+      <div className="fixed inset-0 pointer-events-auto bg-black/40 backdrop-blur-[2px]" onClick={onClose} />
       <div
-        className={`fixed right-0 top-0 h-screen w-[480px] max-w-[92vw] border shadow-2xl ${panelClass}`}
+        className={`fixed right-0 top-0 z-[91] flex h-screen w-[480px] max-w-[92vw] flex-col overflow-hidden border shadow-2xl ${panelClass}`}
       >
-        <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+        <div className="sticky top-0 z-20 flex items-center justify-between border-b border-white/10 px-5 py-4">
           <div>
             <div className="text-xs uppercase tracking-wide text-white/50">{label}</div>
             <div className="text-lg font-semibold">{label} History</div>
           </div>
           <button
-            className="rounded-full border border-white/10 px-3 py-1 text-xs"
+            className="relative z-30 rounded-full border border-white/10 px-3 py-1 text-xs"
             onClick={onClose}
+            type="button"
           >
             Close
           </button>
         </div>
 
-        <div className="h-[calc(100vh-72px)] overflow-y-auto px-5 py-4">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-4 [-webkit-overflow-scrolling:touch]">
           {data.actual.length || data.budget.length ? (
             <>
               <div className="flex flex-wrap items-center justify-between gap-2">

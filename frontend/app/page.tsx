@@ -305,8 +305,8 @@ function PageWithParams() {
     : "max-w-[200px] truncate rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/80 outline-none";
   const cardInner = isLight ? "border-slate-200 bg-white text-slate-700" : "border-white/10 bg-white/5 text-white/70";
   const chatPanel = isLight
-    ? "w-[320px] max-w-[85vw] rounded-2xl border border-slate-200 bg-white shadow-2xl"
-    : "w-[320px] max-w-[85vw] rounded-2xl border border-white/10 bg-[#0B0F1A] shadow-2xl";
+    ? "flex h-[min(78vh,640px)] w-[min(92vw,360px)] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl"
+    : "flex h-[min(78vh,640px)] w-[min(92vw,360px)] flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0B0F1A] shadow-2xl";
   const chatHeader = isLight ? "text-slate-500" : "text-white/50";
   const chatTitle = isLight ? "text-slate-900" : "text-white/90";
   const chatBubbleUser = isLight ? "bg-slate-100 text-slate-800 border-slate-200" : "bg-white/5 text-white/80 border-white/10";
@@ -1651,7 +1651,11 @@ function PageWithParams() {
 
                 <div
                   ref={chatScrollRef}
-                  className={cn("max-h-[240px] space-y-2 overflow-y-auto px-4 py-3 text-sm", isLight ? "text-slate-700" : "text-white/80")}
+                  className={cn(
+                    "min-h-0 flex-1 space-y-2 overflow-y-auto px-4 py-3 text-sm",
+                    isLight ? "text-slate-700" : "text-white/80"
+                  )}
+                  style={{ WebkitOverflowScrolling: "touch" }}
                 >
                   {chatMessages.length === 0 ? (
                     <div className={cn("rounded-xl border p-3 text-xs", cardInner)}>
@@ -1719,7 +1723,7 @@ function PageWithParams() {
                   )}
                 </div>
 
-                <div className="flex items-center gap-2 px-3 py-3">
+                <div className={cn("flex items-center gap-2 border-t px-3 py-3", isLight ? "border-slate-200" : "border-white/10")}>
                   <input
                     className={chatInputClass}
                     placeholder="Ask about ROA, ROE, or net profit..."

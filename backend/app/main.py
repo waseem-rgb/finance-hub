@@ -1,6 +1,7 @@
 # backend/app/main.py
 
 import json
+import logging
 import os
 import tempfile
 from io import BytesIO
@@ -9,7 +10,6 @@ from datetime import datetime, timezone
 from textwrap import wrap
 from typing import Any, Dict, Optional
 from urllib import request as urlrequest
-from urllib.error import URLError
 
 from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,8 +24,9 @@ from app.services.pack_store import PACK_STORE
 from app.services.chat_store import CHAT_STORE
 
 LAST_NORMALIZED: Dict[str, Any] | None = None
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
+AI_LOGGER = logging.getLogger("finance_hub.ai")
 
 app = FastAPI(title="Finance Hub API", version="0.1.0")
 
@@ -41,6 +42,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_origin_regex=r"^https://finance-hub-.*\.vercel\.app$",
 )
 
 
@@ -48,6 +50,48 @@ def _format_million(value: Any) -> str:
     if value is None or not isinstance(value, (int, float)):
         return "—"
     return f"{value / 1_000_000:.2f}M AED"
+
+
+class AIProviderError(Exception):
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _get_openai_api_key() -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY")
+    return api_key.strip() if api_key else None
+
+
+def _openai_chat_completion(messages: list[dict[str, str]]) -> str:
+    api_key = _get_openai_api_key()
+    if not api_key:
+        raise AIProviderError("AI not configured")
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0.2,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8")
+        parsed = json.loads(body)
+        return parsed["choices"][0]["message"]["content"]
+    except Exception as exc:
+        AI_LOGGER.exception("OpenAI chat completion failed (%s): %s", exc.__class__.__name__, str(exc))
+        detail = str(exc).strip() or "provider call failed"
+        raise AIProviderError(detail[:200]) from exc
 
 
 def generate_openai_interpretation(
@@ -60,7 +104,7 @@ def generate_openai_interpretation(
     roe: Any,
     cti: Any,
 ) -> dict | None:
-    if not OPENAI_API_KEY:
+    if not _get_openai_api_key():
         return None
     prompt = (
         "You are a CFO writing an executive financial interpretation. "
@@ -70,40 +114,22 @@ def generate_openai_interpretation(
         f"Total Assets: {_format_million(assets)}. Total Equity: {_format_million(equity)}. "
         f"Net Profit: {_format_million(net_profit)}. ROA: {roa}. ROE: {roe}. Cost-to-Income: {cti}."
     )
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a bank-grade CFO analyst."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
     try:
-        with urlrequest.urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8")
-            parsed = json.loads(body)
-            content = parsed["choices"][0]["message"]["content"]
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                return {"answer": content, "citations": [], "data_backed": False}
-    except (URLError, KeyError, json.JSONDecodeError, TimeoutError):
+        content = _openai_chat_completion(
+            [
+                {"role": "system", "content": "You are a bank-grade CFO analyst."},
+                {"role": "user", "content": prompt},
+            ]
+        )
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return {"answer": content, "citations": [], "data_backed": False}
+    except AIProviderError:
         return None
 
 
-def generate_openai_answer(message: str, context: dict, history: list[dict]) -> dict | None:
-    if not OPENAI_API_KEY:
-        return None
+def generate_openai_answer(message: str, context: dict, history: list[dict]) -> dict:
     prompt = (
         "You are an expert assistant. Answer any user question. "
         "If the answer relies on financial data, use the provided context and include citations. "
@@ -114,32 +140,13 @@ def generate_openai_answer(message: str, context: dict, history: list[dict]) -> 
         f"Context JSON: {json.dumps(context)}\n"
         f"Recent chat history: {json.dumps(history)}"
     )
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
+    content = _openai_chat_completion(
+        [
             {"role": "system", "content": "You are a precise, honest assistant."},
             {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
+        ]
     )
-    try:
-        with urlrequest.urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8")
-            parsed = json.loads(body)
-            content = parsed["choices"][0]["message"]["content"]
-            return json.loads(content)
-    except (URLError, KeyError, json.JSONDecodeError, TimeoutError):
-        return None
+    return json.loads(content)
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -528,6 +535,9 @@ def send_chat_message(payload: ChatMessageRequest) -> Dict[str, Any]:
     message = payload.message.strip()
     CHAT_STORE.add_message(payload.session_id, "user", message)
 
+    if not _get_openai_api_key():
+        raise HTTPException(status_code=503, detail={"error": "ai_not_configured", "detail": "AI not configured"})
+
     pack = PACK_STORE.get_latest_pack()
     if not pack:
         answer = "No financial pack uploaded yet. Upload and normalize an Excel file first."
@@ -537,6 +547,7 @@ def send_chat_message(payload: ChatMessageRequest) -> Dict[str, Any]:
             "citations": [],
             "used_period": None,
             "used_metrics": [],
+            "data_backed": False,
         }
 
     computed = compute_ratios(
@@ -662,34 +673,42 @@ def send_chat_message(payload: ChatMessageRequest) -> Dict[str, Any]:
         answer = f"I can explain ROA, ROE, cost-to-income, total assets, or net profit. Period in use: {period_used}."
 
     history = session.messages[-8:] if session.messages else []
-    openai_payload = generate_openai_answer(
-        message=message,
-        context={
-            "entity": pack.entity or payload.entity,
-            "period": period_used,
-            "kpis": {
-                "total_assets": sources.get("assets", {}).get("value"),
-                "total_equity": sources.get("equity", {}).get("value"),
-                "net_profit": sources.get("net_profit", {}).get("value"),
-                "customers_deposits": sources.get("customers_deposits", {}).get("value"),
+    try:
+        openai_payload = generate_openai_answer(
+            message=message,
+            context={
+                "entity": pack.entity or payload.entity,
+                "period": period_used,
+                "kpis": {
+                    "total_assets": sources.get("assets", {}).get("value"),
+                    "total_equity": sources.get("equity", {}).get("value"),
+                    "net_profit": sources.get("net_profit", {}).get("value"),
+                    "customers_deposits": sources.get("customers_deposits", {}).get("value"),
+                },
+                "ratios": computed.get("ratios"),
+                "evidence": evidence_list,
+                "evidence_from_drawer": payload.evidence_context or [],
             },
-            "ratios": computed.get("ratios"),
-            "evidence": evidence_list,
-            "evidence_from_drawer": payload.evidence_context or [],
-        },
-        history=history,
-    )
-    if openai_payload and isinstance(openai_payload.get("answer"), str):
+            history=history,
+        )
+    except AIProviderError as exc:
+        raise HTTPException(status_code=502, detail={"error": "ai_provider_error", "detail": exc.detail}) from exc
+    except json.JSONDecodeError as exc:
+        AI_LOGGER.exception("OpenAI response parsing failed (%s): %s", exc.__class__.__name__, str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ai_provider_error", "detail": "invalid JSON returned by AI provider"},
+        ) from exc
+
+    if isinstance(openai_payload.get("answer"), str):
         answer = openai_payload["answer"]
         citations = openai_payload.get("citations") or citations
         data_backed = bool(openai_payload.get("data_backed"))
     else:
-        if OPENAI_API_KEY:
-            answer = "AI is temporarily unavailable. Please try again."
-            data_backed = False
-        else:
-            answer = "AI is not configured. Please set OPENAI_API_KEY."
-            data_backed = False
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ai_provider_error", "detail": "missing answer field in AI response"},
+        )
 
     summary = {
         "executive_summary": f"Summary for {period_used} based on latest uploaded pack.",
