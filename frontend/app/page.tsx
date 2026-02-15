@@ -5,9 +5,11 @@ import { useSearchParams } from "next/navigation";
 import { BarChart3, Building2, FileSpreadsheet, ShieldCheck, Users } from "lucide-react";
 import {
   API_BASE_URL,
-  apiFetch,
   createChatSession,
+  createBoardPackJob,
+  downloadBoardPackJob,
   getPeriods,
+  getBoardPackJob,
   getRatios,
   getVariance,
   getMetricHistory,
@@ -21,6 +23,8 @@ import KpiCard from "@/components/dashboard/KpiCard";
 import RatioCard from "@/components/dashboard/RatioCard";
 import { Role, RoleProvider } from "@/components/dashboard/RoleContext";
 import MetricGraphDrawer from "@/components/graphs/MetricGraphDrawer";
+import RoleGuard from "@/components/auth/RoleGuard";
+import { getStoredRole, isValidRole, setRoleForDemo } from "@/lib/roleAuth";
 
 function cn(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
@@ -119,12 +123,17 @@ function formatPercent(v: any) {
 
 function normalizeInterpretationPayload(payload: any, fallback?: string) {
   const risks = Array.isArray(payload?.risks) ? payload.risks : [];
+  const clean = (v: any) =>
+    String(v ?? "")
+      .replace(/[*_`#>]+/g, "")
+      .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+      .trim();
   return {
-    executive_summary: payload?.executive_summary || payload?.answer || fallback || "No interpretation available.",
-    profitability: payload?.profitability || null,
-    efficiency: payload?.efficiency || null,
-    balance_sheet: payload?.balance_sheet || null,
-    risks: risks.filter(Boolean),
+    executive_summary: clean(payload?.executive_summary || payload?.answer || fallback || "No interpretation available."),
+    profitability: clean(payload?.profitability || ""),
+    efficiency: clean(payload?.efficiency || ""),
+    balance_sheet: clean(payload?.balance_sheet || ""),
+    risks: risks.map((r: any) => clean(r)).filter(Boolean),
   };
 }
 
@@ -137,6 +146,42 @@ function hasInterpretationContent(payload: any) {
       payload.balance_sheet ||
       (Array.isArray(payload.risks) && payload.risks.length > 0)
   );
+}
+
+function renderStructuredContent(value: any) {
+  if (!value) return <span>—</span>;
+  const lines = String(value)
+    .split("\n")
+    .map((line) => line.replace(/[*_`#>]+/g, "").trim())
+    .filter(Boolean);
+  const bullets = lines.filter((line) => /^[-•]\s*/.test(line));
+  if (bullets.length > 0) {
+    return (
+      <ul className="list-disc pl-5 space-y-1">
+        {bullets.map((line, idx) => (
+          <li key={`${line}-${idx}`}>{line.replace(/^[-•]\s*/, "")}</li>
+        ))}
+      </ul>
+    );
+  }
+  return <p>{lines.join(" ")}</p>;
+}
+
+function classifyChatError(message: string, errorCode?: string) {
+  const lower = (message || "").toLowerCase();
+  if (lower.includes("ai_not_configured") || lower.includes("not configured") || lower.includes("missing key")) {
+    return "AI is not configured on the server (missing OPENAI_API_KEY).";
+  }
+  if (lower.includes("timeout") || errorCode === "TIMEOUT_ERROR") {
+    return "AI request timed out. Please retry.";
+  }
+  if (lower.includes("ai_upstream_failure") || lower.includes("upstream")) {
+    return "AI upstream provider failed. Please retry in a moment.";
+  }
+  if (errorCode === "NETWORK_ERROR") {
+    return "Backend is unreachable. Check API connectivity.";
+  }
+  return message || "AI is temporarily unavailable. Please try again.";
 }
 
 type RolePermissions = {
@@ -216,9 +261,12 @@ const ROLE_PERMISSIONS: Record<Role, RolePermissions> = {
 };
 
 const ROLE_SECTIONS: Record<Role, NavSection[]> = {
+  // CFO: full demo surface.
   CFO: ["Overview", "Statements", "Governance", "Roles & Access"],
+  // CEO/Director/CB: executive + governance scope only.
   CEO: ["Overview", "Governance"],
   Director: ["Overview", "Governance"],
+  // Shareholder: restricted to headline overview.
   Shareholder: ["Overview"],
   CB: ["Overview", "Governance"],
 };
@@ -237,6 +285,8 @@ function PageWithParams() {
   const [section, setSection] = React.useState<NavSection>("Overview");
 
   const [periods, setPeriods] = React.useState<string[]>([]);
+  const [latestUploadId, setLatestUploadId] = React.useState<string | null>(null);
+  const [hasBackendPack, setHasBackendPack] = React.useState<boolean>(false);
   const [periodsLoading, setPeriodsLoading] = React.useState<boolean>(true);
   const [data, setData] = React.useState<any>(null);
   const [loading, setLoading] = React.useState<boolean>(true);
@@ -260,6 +310,7 @@ function PageWithParams() {
 
   const [exportOpen, setExportOpen] = React.useState<boolean>(false);
   const [exportMessage, setExportMessage] = React.useState<string | null>(null);
+  const [exportProgress, setExportProgress] = React.useState<number>(0);
 
   const [chatOpen, setChatOpen] = React.useState<boolean>(false);
   const [chatSessionId, setChatSessionId] = React.useState<string | null>(null);
@@ -358,8 +409,24 @@ function PageWithParams() {
       if (res.ok) {
         const sorted = [...(res.data.periods || [])].sort((a, b) => periodKey(a) - periodKey(b));
         setPeriods(sorted);
+        setLatestUploadId(res.data.latest_upload_id || null);
+        setHasBackendPack(Boolean(res.data.has_pack));
         if (res.data.entity) {
           setEntity(res.data.entity);
+        }
+        if (typeof window !== "undefined" && res.data.latest_upload_id) {
+          const storedPackState = window.localStorage.getItem("finance_hub_pack_state");
+          if (storedPackState) {
+            try {
+              const parsed = JSON.parse(storedPackState);
+              if (parsed?.latest_upload_id === res.data.latest_upload_id) {
+                if (typeof parsed.entity === "string") setEntity(parsed.entity);
+                if (typeof parsed.period === "string" && sorted.includes(parsed.period)) setPeriod(parsed.period);
+              }
+            } catch {
+              // ignore stale local state
+            }
+          }
         }
 
         // Initialize period only once, prefer query param if valid, else latest.
@@ -387,23 +454,33 @@ function PageWithParams() {
   }, [initialQueryPeriod]);
 
   React.useEffect(() => {
-    if (typeof window === "undefined") return;
-    const storedRole = window.localStorage.getItem("finance_hub_role");
-    if (storedRole && ["CFO", "CEO", "Director", "Shareholder", "CB"].includes(storedRole)) {
+    const storedRole = getStoredRole();
+    if (storedRole && isValidRole(storedRole)) {
       setRole(storedRole as Role);
       setApiRole(storedRole);
       return;
     }
+    setRoleForDemo(role);
     setApiRole(role);
-    window.localStorage.setItem("finance_hub_role", role);
   }, []);
 
   React.useEffect(() => {
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem("finance_hub_role", role);
-    }
+    setRoleForDemo(role);
     setApiRole(role);
   }, [role]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!latestUploadId) return;
+    window.localStorage.setItem(
+      "finance_hub_pack_state",
+      JSON.stringify({
+        latest_upload_id: latestUploadId,
+        entity,
+        period,
+      })
+    );
+  }, [latestUploadId, entity, period]);
 
   React.useEffect(() => {
     if (typeof window === "undefined") return;
@@ -483,6 +560,8 @@ function PageWithParams() {
       const res = await uploadAndNormalizeExcel(file);
       if (res.ok) {
         setUploadPreview(res.data);
+        setLatestUploadId(res.data.upload_id);
+        setHasBackendPack(true);
         if (res.data.entity) {
           setEntity(res.data.entity);
         }
@@ -567,42 +646,67 @@ function PageWithParams() {
     if (exportLoading) return;
     try {
       setExportLoading(true);
-      const res = await apiFetch(`/exports/board-pack`);
-      if (!res.ok) {
-        let message = "Board Pack export failed.";
-        try {
-          const body = await res.json();
-          if (body?.detail) {
-            message = typeof body.detail === "string" ? body.detail : body.detail.detail || JSON.stringify(body.detail);
-          }
-        } catch {
-          // ignore
+      setExportProgress(5);
+      const jobRes = await createBoardPackJob();
+      if (!jobRes.ok) {
+        const message = jobRes.message || "Board Pack export failed.";
+        setExportMessage(message);
+        setToast({ type: "error", message });
+        setTimeout(() => setExportMessage(null), 3000);
+        setTimeout(() => setToast(null), 3000);
+        return;
+      }
+      const jobId = jobRes.data.job_id;
+      setExportMessage("Generating Board Pack...");
+      let done = false;
+      let failed = false;
+      for (let i = 0; i < 45; i += 1) {
+        const statusRes = await getBoardPackJob(jobId);
+        if (!statusRes.ok) {
+          const message = statusRes.message || "Failed to check export status.";
+          setExportMessage(message);
+          setToast({ type: "error", message });
+          failed = true;
+          break;
         }
-        setExportMessage(message);
-        setToast({ type: "error", message });
-        setTimeout(() => setExportMessage(null), 2500);
-        setTimeout(() => setToast(null), 2500);
+        setExportProgress(statusRes.data.progress || Math.min(95, 10 + i * 2));
+        if (statusRes.data.status === "failed") {
+          const message = statusRes.data.error || "Board Pack export failed.";
+          setExportMessage(message);
+          setToast({ type: "error", message });
+          failed = true;
+          break;
+        }
+        if (statusRes.data.status === "completed" && statusRes.data.download_ready) {
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      if (failed) {
+        setTimeout(() => setExportMessage(null), 3000);
+        setTimeout(() => setToast(null), 3000);
         return;
       }
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("application/pdf")) {
-        const text = await res.text();
-        const message = `Unexpected export response: ${text || "invalid content type"}`;
+      if (!done) {
+        const message = "Export is taking longer than expected. Please retry.";
         setExportMessage(message);
         setToast({ type: "error", message });
-        setTimeout(() => setExportMessage(null), 2500);
-        setTimeout(() => setToast(null), 2500);
+        setTimeout(() => setExportMessage(null), 3000);
+        setTimeout(() => setToast(null), 3000);
         return;
       }
-      const blob = await res.blob();
-      if (!blob.size) {
-        const message = "Board Pack export failed: empty PDF.";
+      const downloadRes = await downloadBoardPackJob(jobId);
+      if (!downloadRes.ok) {
+        const message = downloadRes.message || "Board Pack download failed.";
         setExportMessage(message);
         setToast({ type: "error", message });
-        setTimeout(() => setExportMessage(null), 2500);
-        setTimeout(() => setToast(null), 2500);
+        setTimeout(() => setExportMessage(null), 3000);
+        setTimeout(() => setToast(null), 3000);
         return;
       }
+      const blob = downloadRes.data;
+      if (!blob.size) throw new Error("Board Pack export failed: empty PDF.");
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -611,6 +715,7 @@ function PageWithParams() {
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
+      setExportProgress(100);
       setExportMessage("Board Pack PDF downloaded.");
       setToast({ type: "success", message: "Board Pack PDF downloaded." });
       setTimeout(() => setExportMessage(null), 2500);
@@ -623,6 +728,7 @@ function PageWithParams() {
       setTimeout(() => setToast(null), 2500);
     } finally {
       setExportLoading(false);
+      setTimeout(() => setExportProgress(0), 500);
     }
   }
 
@@ -686,17 +792,24 @@ function PageWithParams() {
           }
         }, 20);
         if (res.data?.meta?.reason === "ai_not_configured") {
-          setToast({ type: "error", message: "AI key missing. Showing deterministic financial responses." });
+          setToast({ type: "error", message: "AI key missing on backend. Showing deterministic fallback response." });
+          setTimeout(() => setToast(null), 3000);
+        } else if (res.data?.meta?.reason === "ai_timeout") {
+          setToast({ type: "error", message: "AI upstream timeout. Showing deterministic fallback response." });
+          setTimeout(() => setToast(null), 3000);
+        } else if (res.data?.meta?.reason === "ai_upstream_failure") {
+          setToast({ type: "error", message: "AI provider failed. Showing deterministic fallback response." });
           setTimeout(() => setToast(null), 3000);
         }
       } else {
-        const errorMessage = res.message || "No answer.";
+        const errorMessage = classifyChatError(res.message, (res as any).error);
         setChatMessages((prev) => [...prev, { role: "assistant", content: errorMessage }]);
         setToast({ type: "error", message: errorMessage });
         setTimeout(() => setToast(null), 3000);
       }
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : "Sorry, I could not answer that right now.";
+      const raw = err instanceof Error ? err.message : "Sorry, I could not answer that right now.";
+      const errorMessage = classifyChatError(raw);
       setChatMessages((prev) => [...prev, { role: "assistant", content: errorMessage }]);
       setToast({ type: "error", message: errorMessage });
       setTimeout(() => setToast(null), 3000);
@@ -739,7 +852,7 @@ function PageWithParams() {
       setInterpretationLoading(true);
       const sessionId = await ensureChatSession();
       const prompt =
-        "Interpret the financial report from a CFO perspective with sections: Executive Summary, Profitability, Efficiency, Balance Sheet, and Risks. Keep it concise and evidence-based.";
+        "Provide a CFO-grade interpretation as clean JSON only (no markdown). Keys required: executive_summary, profitability, efficiency, balance_sheet, risks (array). Include ROA/ROE/net profit drivers, cost-to-income commentary, and balance-sheet focus points.";
       const res = await sendChatMessage(sessionId, prompt, entity, period, scenario, undefined, 1);
       if (typeof window !== "undefined") {
         console.debug("[finance-hub] interpretation payload", res);
@@ -764,7 +877,7 @@ function PageWithParams() {
     role === "CB" ? "Central Bank / Regulator View" : role === "Shareholder" ? "Investor View" : `${role} View`;
 
   const showLoading = loading;
-  const hasPack = !!data?.computed;
+  const hasPack = hasBackendPack || !!data?.computed;
   const showError = !data && !!period;
 
   const totalAssetsValue = showLoading
@@ -1171,6 +1284,8 @@ function PageWithParams() {
                           }
                           setData(null);
                           setPeriods([]);
+                          setLatestUploadId(null);
+                          setHasBackendPack(false);
                           setPeriod("");
                           setEntity("");
                           setUploadPreview(null);
@@ -1183,6 +1298,9 @@ function PageWithParams() {
                           setChatSessionId(null);
                           setToast({ type: "success", message: "Cleared backend pack. Re-fetching periods..." });
                           setTimeout(() => setToast(null), 2500);
+                          if (typeof window !== "undefined") {
+                            window.localStorage.removeItem("finance_hub_pack_state");
+                          }
                           periodInitialized.current = false;
                           const periodsRes = await getPeriods();
                           if (periodsRes.ok) {
@@ -1271,6 +1389,7 @@ function PageWithParams() {
               ) : null}
 
               {exportMessage ? <p className={cn("mt-2 text-xs", panelMuted)}>{exportMessage}</p> : null}
+              {exportLoading ? <p className={cn("mt-1 text-xs", panelMuted)}>Export progress: {exportProgress}%</p> : null}
             </div>
 
             {/* CONTENT AREA (Tabs) */}
@@ -1508,27 +1627,35 @@ function PageWithParams() {
                     {interpretationData ? (
                       <div className="mt-4 space-y-3">
                         <div className={cn("rounded-2xl border p-4 text-sm", cardInner)}>
-                          <div className={cn("text-xs", panelMuted)}>Interpretation (CFO view)</div>
-                          <div className="mt-2">{interpretationData.executive_summary ?? "—"}</div>
+                          <div className={cn("text-xs font-semibold", panelMuted)}>Executive Summary</div>
+                          <div className="mt-2">{renderStructuredContent(interpretationData.executive_summary)}</div>
                         </div>
 
                         <div className="grid gap-3 md:grid-cols-2">
                           <div className={cn("rounded-2xl border p-4 text-sm", cardInner)}>
-                            <div className={cn("text-xs", panelMuted)}>Profitability</div>
-                            <div className="mt-2">{interpretationData.profitability ?? "—"}</div>
+                            <div className={cn("text-xs font-semibold", panelMuted)}>Profitability</div>
+                            <div className="mt-2">{renderStructuredContent(interpretationData.profitability)}</div>
                           </div>
                           <div className={cn("rounded-2xl border p-4 text-sm", cardInner)}>
-                            <div className={cn("text-xs", panelMuted)}>Efficiency</div>
-                            <div className="mt-2">{interpretationData.efficiency ?? "—"}</div>
+                            <div className={cn("text-xs font-semibold", panelMuted)}>Efficiency</div>
+                            <div className="mt-2">{renderStructuredContent(interpretationData.efficiency)}</div>
                           </div>
                           <div className={cn("rounded-2xl border p-4 text-sm", cardInner)}>
-                            <div className={cn("text-xs", panelMuted)}>Balance Sheet</div>
-                            <div className="mt-2">{interpretationData.balance_sheet ?? "—"}</div>
+                            <div className={cn("text-xs font-semibold", panelMuted)}>Balance Sheet</div>
+                            <div className="mt-2">{renderStructuredContent(interpretationData.balance_sheet)}</div>
                           </div>
                           <div className={cn("rounded-2xl border p-4 text-sm", cardInner)}>
-                            <div className={cn("text-xs", panelMuted)}>Risks / Focus</div>
+                            <div className={cn("text-xs font-semibold", panelMuted)}>Risks & Focus</div>
                             <div className="mt-2">
-                              {(interpretationData.risks || []).length ? (interpretationData.risks || []).join(" • ") : "—"}
+                              {(interpretationData.risks || []).length ? (
+                                <ul className="list-disc pl-5 space-y-1">
+                                  {(interpretationData.risks || []).map((risk: string, idx: number) => (
+                                    <li key={`${risk}-${idx}`}>{risk}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                "—"
+                              )}
                             </div>
                           </div>
                         </div>
@@ -1670,7 +1797,7 @@ function PageWithParams() {
                         <div className="mt-4 space-y-3">
                           <div className={cn("rounded-2xl border p-3", cardInner)}>
                             <p className={cn("text-xs", panelMuted)}>Dataset Status</p>
-                            <p className={cn("mt-1 text-sm", panelText)}>{canSeeControls ? "Draft / In Review" : "Approved / Published"}</p>
+                            <p className={cn("mt-1 text-sm", panelText)}>{hasBackendPack ? "Draft / In Review" : "No active dataset"}</p>
                           </div>
 
                           <div className={cn("rounded-2xl border p-3", cardInner)}>
@@ -1694,7 +1821,9 @@ function PageWithParams() {
               ) : section === "Governance" ? (
                 governancePlaceholder
               ) : (
-                rolesPlaceholder
+                <RoleGuard role={role} allowed={["CFO"]}>
+                  {rolesPlaceholder}
+                </RoleGuard>
               )}
             </div>
           </main>

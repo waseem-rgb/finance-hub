@@ -1,7 +1,10 @@
-const RAW_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "http://127.0.0.1:8000";
+const RAW_API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL?.trim() ||
+  (process.env.NODE_ENV === "production" ? "https://api.momentumfirmfinance.com" : "http://127.0.0.1:8000");
 export const API_BASE_URL = RAW_API_BASE_URL.replace(/\/+$/, "");
 const VALID_ROLES = new Set(["CFO", "CEO", "Director", "Shareholder", "CB"]);
 let activeRole = "CFO";
+const API_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS || 20000);
 
 if (typeof window !== "undefined" && process.env.NODE_ENV !== "production") {
   // Dev-only startup diagnostic for confirming resolved API target.
@@ -40,15 +43,27 @@ async function handleResponse<T>(res: Response): Promise<ApiOk<T> | ApiErr> {
 
 async function request<T>(path: string, init?: RequestInit): Promise<ApiOk<T> | ApiErr> {
   try {
-    const res = await fetch(`${API_BASE_URL}${path}`, withRoleHeader(init));
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    const res = await fetch(`${API_BASE_URL}${path}`, withRoleHeader({ ...(init || {}), signal: controller.signal }));
+    clearTimeout(timeout);
     return await handleResponse<T>(res);
   } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      return { ok: false, error: "TIMEOUT_ERROR", message: "Request timed out" };
+    }
     return { ok: false, error: "NETWORK_ERROR", message: err instanceof Error ? err.message : "Network error" };
   }
 }
 
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(`${API_BASE_URL}${path}`, withRoleHeader(init));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    return await fetch(`${API_BASE_URL}${path}`, withRoleHeader({ ...(init || {}), signal: controller.signal }));
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export function getPeriods() {
@@ -146,6 +161,37 @@ export function getBoardPack() {
 
 export function clearPack() {
   return request<{ status: string }>("/pack/clear", { method: "POST" });
+}
+
+export function createBoardPackJob() {
+  return request<{ job_id: string; status: string }>("/exports/board-pack/jobs", { method: "POST" });
+}
+
+export function getBoardPackJob(job_id: string) {
+  return request<{ job_id: string; status: string; progress: number; error?: string | null; download_ready: boolean; filename?: string | null }>(
+    `/exports/board-pack/jobs/${job_id}`
+  );
+}
+
+export async function downloadBoardPackJob(job_id: string): Promise<ApiOk<Blob> | ApiErr> {
+  try {
+    const res = await apiFetch(`/exports/board-pack/jobs/${job_id}/download`);
+    if (!res.ok) {
+      let message = `Request failed: ${res.status}`;
+      try {
+        const body = await res.json();
+        if (body?.detail) message = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      } catch {}
+      return { ok: false, error: "HTTP_ERROR", message };
+    }
+    const blob = await res.blob();
+    return { ok: true, data: blob };
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      return { ok: false, error: "TIMEOUT_ERROR", message: "Request timed out" };
+    }
+    return { ok: false, error: "NETWORK_ERROR", message: err instanceof Error ? err.message : "Network error" };
+  }
 }
 
 export async function getMetricHistory(

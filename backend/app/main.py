@@ -3,15 +3,18 @@
 import json
 import logging
 import os
+import re
 import tempfile
+import threading
 from io import BytesIO
 import traceback
 from datetime import datetime, timezone
 from textwrap import wrap
 from typing import Any, Dict, Optional
+from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -26,6 +29,7 @@ from app.services.chat_store import CHAT_STORE
 LAST_NORMALIZED: Dict[str, Any] | None = None
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
 AI_LOGGER = logging.getLogger("finance_hub.ai")
 ALLOWED_ROLES = {"CFO", "CEO", "Director", "Shareholder", "CB"}
 
@@ -34,6 +38,9 @@ ROLE_ROUTE_ACCESS: dict[str, set[str]] = {
     "view_exec_governance": {"CFO", "CEO", "Director", "CB"},
     "cfo_only": {"CFO"},
 }
+
+EXPORT_JOBS: Dict[str, Dict[str, Any]] = {}
+EXPORT_JOBS_LOCK = threading.Lock()
 
 app = FastAPI(title="Finance Hub API", version="0.1.0")
 
@@ -49,7 +56,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_origin_regex=r"^https://finance-hub-.*\.vercel\.app$",
+    allow_origin_regex=r"^https://finance(-hub)?-.*\.vercel\.app$",
 )
 
 
@@ -91,6 +98,43 @@ def _format_million(value: Any) -> str:
     return f"{value / 1_000_000:.2f}M AED"
 
 
+def _sanitize_markdown_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = re.sub(r"[*_`#>]+", "", text)
+    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+def _job_update(job_id: str, **kwargs: Any) -> None:
+    with EXPORT_JOBS_LOCK:
+        job = EXPORT_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(kwargs)
+
+
+def _job_create() -> str:
+    from uuid import uuid4
+
+    job_id = str(uuid4())
+    with EXPORT_JOBS_LOCK:
+        EXPORT_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "error": None,
+            "download_ready": False,
+            "filename": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+            "pdf_bytes": None,
+        }
+    return job_id
+
+
 class AIProviderError(Exception):
     def __init__(self, detail: str):
         super().__init__(detail)
@@ -98,34 +142,46 @@ class AIProviderError(Exception):
 
 
 def _normalize_interpretation_payload(payload: Any, fallback: Optional[str] = None) -> dict:
+    def _norm_text(v: Any, default: Optional[str] = None) -> str:
+        cleaned = _sanitize_markdown_text(v)
+        return cleaned or (default or "")
+
+    default_exec = fallback or "No interpretation available."
+    default_profit = "ROA/ROE and net profit trends should be reviewed with period-over-period drivers."
+    default_eff = "Cost-to-income and operating expense trajectory should be monitored against revenue quality."
+    default_bs = "Balance sheet review should cover assets, equity, deposits, and leverage buffers."
+    default_risks = [
+        "Liquidity buffers and funding concentration should be monitored.",
+        "Asset quality and concentration trends should be reviewed.",
+        "Operational resilience and cost discipline remain focus areas.",
+    ]
+
     if isinstance(payload, dict):
         risks = payload.get("risks")
         if not isinstance(risks, list):
             risks = [str(risks)] if risks else []
+        cleaned_risks = [_norm_text(item) for item in risks if _norm_text(item)]
         return {
-            "executive_summary": payload.get("executive_summary")
-            or payload.get("answer")
-            or fallback
-            or "No interpretation available.",
-            "profitability": payload.get("profitability"),
-            "efficiency": payload.get("efficiency"),
-            "balance_sheet": payload.get("balance_sheet"),
-            "risks": [str(item) for item in risks if item is not None],
+            "executive_summary": _norm_text(payload.get("executive_summary") or payload.get("answer"), default_exec),
+            "profitability": _norm_text(payload.get("profitability"), default_profit),
+            "efficiency": _norm_text(payload.get("efficiency"), default_eff),
+            "balance_sheet": _norm_text(payload.get("balance_sheet"), default_bs),
+            "risks": cleaned_risks or default_risks,
         }
     if isinstance(payload, str) and payload.strip():
         return {
-            "executive_summary": payload.strip(),
-            "profitability": None,
-            "efficiency": None,
-            "balance_sheet": None,
-            "risks": [],
+            "executive_summary": _norm_text(payload, default_exec),
+            "profitability": default_profit,
+            "efficiency": default_eff,
+            "balance_sheet": default_bs,
+            "risks": default_risks,
         }
     return {
-        "executive_summary": fallback or "No interpretation available.",
-        "profitability": None,
-        "efficiency": None,
-        "balance_sheet": None,
-        "risks": [],
+        "executive_summary": _norm_text(fallback, default_exec),
+        "profitability": default_profit,
+        "efficiency": default_eff,
+        "balance_sheet": default_bs,
+        "risks": default_risks,
     }
 
 
@@ -154,15 +210,38 @@ def _openai_chat_completion(messages: list[dict[str, str]]) -> str:
         },
         method="POST",
     )
-    try:
-        with urlrequest.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
-            body = resp.read().decode("utf-8")
-        parsed = json.loads(body)
-        return parsed["choices"][0]["message"]["content"]
-    except Exception as exc:
-        AI_LOGGER.exception("OpenAI chat completion failed (%s): %s", exc.__class__.__name__, str(exc))
-        detail = str(exc).strip() or "provider call failed"
-        raise AIProviderError(detail[:200]) from exc
+    last_exc: Optional[Exception] = None
+    for attempt in range(OPENAI_MAX_RETRIES + 1):
+        try:
+            with urlrequest.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
+                body = resp.read().decode("utf-8")
+            parsed = json.loads(body)
+            return parsed["choices"][0]["message"]["content"]
+        except urlerror.HTTPError as exc:
+            AI_LOGGER.exception("OpenAI HTTP error (%s): %s", exc.code, str(exc))
+            detail = f"AI upstream failure (HTTP {exc.code})"
+            if attempt >= OPENAI_MAX_RETRIES:
+                raise AIProviderError(detail[:200]) from exc
+            last_exc = exc
+        except TimeoutError as exc:
+            AI_LOGGER.exception("OpenAI timeout: %s", str(exc))
+            detail = "AI upstream timeout"
+            if attempt >= OPENAI_MAX_RETRIES:
+                raise AIProviderError(detail[:200]) from exc
+            last_exc = exc
+        except Exception as exc:
+            AI_LOGGER.exception("OpenAI chat completion failed (%s): %s", exc.__class__.__name__, str(exc))
+            lower = (str(exc) or "").lower()
+            if "timed out" in lower or "timeout" in lower:
+                detail = "AI upstream timeout"
+            else:
+                detail = "AI upstream failure"
+            if attempt >= OPENAI_MAX_RETRIES:
+                raise AIProviderError(detail[:200]) from exc
+            last_exc = exc
+    if last_exc:
+        raise AIProviderError("AI upstream failure") from last_exc
+    raise AIProviderError("AI upstream failure")
 
 
 def generate_openai_interpretation(
@@ -228,6 +307,20 @@ def generate_openai_answer(message: str, context: dict, history: list[dict]) -> 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/debug/status")
+def debug_status(_: str = Depends(require_roles("view_exec_governance"))) -> Dict[str, Any]:
+    pack = PACK_STORE.get_latest_pack()
+    with EXPORT_JOBS_LOCK:
+        active_jobs_count = sum(1 for job in EXPORT_JOBS.values() if job.get("status") not in {"completed", "failed"})
+    return {
+        "status": "ok",
+        "openai_key_present": bool(_get_openai_api_key()),
+        "last_upload_id": pack.upload_id if pack else None,
+        "current_entity": pack.entity if pack else None,
+        "active_jobs_count": active_jobs_count,
+    }
 
 @app.get("/ratios")
 def ratios(
@@ -804,7 +897,8 @@ def send_chat_message(
             except AIProviderError as exc:
                 AI_LOGGER.exception("AI provider error in /chat/message: %s", exc.detail)
                 data_backed = False
-                meta = {"provider": "fallback", "reason": "ai_provider_error", "detail": exc.detail}
+                reason = "ai_timeout" if "timeout" in exc.detail.lower() else "ai_upstream_failure"
+                meta = {"provider": "fallback", "reason": reason, "detail": exc.detail}
             except Exception as exc:
                 AI_LOGGER.exception("AI processing failed (%s): %s", exc.__class__.__name__, str(exc))
                 data_backed = False
@@ -1142,6 +1236,80 @@ def export_board_pack(_: str = Depends(require_roles("view_exec_governance"))) -
                 "error_type": exc.__class__.__name__,
             },
         ) from exc
+
+
+def _run_board_pack_export_job(job_id: str) -> None:
+    _job_update(job_id, status="running", progress=20)
+    try:
+        response = export_board_pack("CFO")
+        pdf_bytes = response.body if hasattr(response, "body") else None
+        if not pdf_bytes:
+            raise RuntimeError("empty export bytes")
+        filename = "board-pack.pdf"
+        disposition = (response.headers or {}).get("Content-Disposition")
+        if disposition and "filename=" in disposition:
+            filename = disposition.split("filename=", 1)[-1].strip().strip('"')
+        _job_update(
+            job_id,
+            status="completed",
+            progress=100,
+            filename=filename,
+            download_ready=True,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            pdf_bytes=pdf_bytes,
+        )
+    except Exception as exc:
+        AI_LOGGER.exception("Export job failed (%s): %s", exc.__class__.__name__, str(exc))
+        _job_update(
+            job_id,
+            status="failed",
+            progress=100,
+            error=_sanitize_markdown_text(str(exc)) or "Export failed",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+
+@app.post("/exports/board-pack/jobs")
+def create_board_pack_job(
+    background_tasks: BackgroundTasks,
+    _: str = Depends(require_roles("view_exec_governance")),
+) -> Dict[str, Any]:
+    job_id = _job_create()
+    background_tasks.add_task(_run_board_pack_export_job, job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/exports/board-pack/jobs/{job_id}")
+def get_board_pack_job(job_id: str, _: str = Depends(require_roles("view_exec_governance"))) -> Dict[str, Any]:
+    with EXPORT_JOBS_LOCK:
+        job = EXPORT_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Export job not found")
+        return {
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "progress": job["progress"],
+            "error": job["error"],
+            "download_ready": job["download_ready"],
+            "filename": job["filename"],
+        }
+
+
+@app.get("/exports/board-pack/jobs/{job_id}/download")
+def download_board_pack_job(job_id: str, _: str = Depends(require_roles("view_exec_governance"))) -> Response:
+    with EXPORT_JOBS_LOCK:
+        job = EXPORT_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Export job not found")
+        if job.get("status") != "completed" or not job.get("pdf_bytes"):
+            raise HTTPException(status_code=409, detail="Export not ready")
+        filename = job.get("filename") or f"board-pack-{job_id}.pdf"
+        pdf_bytes = job["pdf_bytes"]
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 @app.get("/routes")
 def list_routes():
